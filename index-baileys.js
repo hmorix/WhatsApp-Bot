@@ -610,9 +610,11 @@ async function connectWhatsApp() {
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
         markOnlineOnConnect: false,         // Anti-Ban: Don't stay permanently online 24/7
-        keepAliveIntervalMs: 25_000,        // ping WA every 25s to prevent 408 timeouts
-        connectTimeoutMs: 60_000,           // allow up to 60s for initial connect
-        retryRequestDelayMs: 2_000,         // wait 2s before retrying a failed request
+        keepAliveIntervalMs: 60_000,        // 60s interval gives a wide 65s buffer (stops artificial 408 disconnects)
+        defaultQueryTimeoutMs: 90_000,      // Allow 90s for queries to complete on mobile networks
+        connectTimeoutMs: 60_000,           // Allow up to 60s for initial connect
+        retryRequestDelayMs: 2_500,         // Wait 2.5s before retrying
+        maxMsgRetryCount: 5,
         browser: Browsers.macOS('Desktop'), // Anti-Ban: Official desktop browser signature (NOT 'HMorix Bot')
     });
 
@@ -640,21 +642,27 @@ async function connectWhatsApp() {
                 process.exit(1);
             } else if (code === 428) {
                 // 428 = Precondition Required — WA is rejecting the session key state.
-                // Clearing auth forces a clean re-registration on next start.
                 console.log('⚠️  Session rejected by WhatsApp (code 428). Clearing stale auth & exiting.');
                 console.log('   ➜ Restart the bot and re-scan the QR code.');
                 fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 fs.mkdirSync(AUTH_DIR, { recursive: true });
                 process.exit(1);
             } else if (code === DisconnectReason.connectionReplaced || code === 440) {
-                // 440 = Connection Replaced — another WhatsApp Web session (browser/another bot)
-                // opened on the same account and kicked this one out.
+                // 440 = Connection Replaced — another WhatsApp Web session opened
                 console.log('⚠️  [Code 440] Session replaced! Another WhatsApp Web session is active.');
                 console.log('   ➜ Close WhatsApp Web in ALL browser tabs on this account.');
                 console.log('   ➜ Make sure only ONE instance of this bot is running.');
                 console.log('   ➜ Retrying in 15s — bot will reclaim the session automatically...');
-                reconnectAttempts = 0; // reset so next attempt starts at 15s flat
+                reconnectAttempts = 0;
                 setTimeout(() => connectWhatsApp(), 15_000);
+            } else if (code === DisconnectReason.restartRequired || code === 515) {
+                // 515 = Normal restart required by WhatsApp
+                console.log('🔄 WhatsApp requested session restart (code 515). Reconnecting in 3s...');
+                setTimeout(() => connectWhatsApp(), 3000);
+            } else if (code === DisconnectReason.connectionLost || code === DisconnectReason.timedOut || code === 408) {
+                // 408 = Mobile network switch / TCP ping timeout — restore instantly
+                console.log('📡 Mobile network route changed/timeout (code 408). Auto-restoring in 3s...');
+                setTimeout(() => connectWhatsApp(), 3000);
             } else {
                 // Exponential backoff: 5s, 10s, 20s, 40s, then cap at 60s
                 reconnectAttempts++;
