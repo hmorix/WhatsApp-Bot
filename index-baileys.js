@@ -597,6 +597,15 @@ async function connectWhatsApp() {
                 fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 fs.mkdirSync(AUTH_DIR, { recursive: true });
                 process.exit(1);
+            } else if (code === DisconnectReason.connectionReplaced || code === 440) {
+                // 440 = Connection Replaced — another WhatsApp Web session (browser/another bot)
+                // opened on the same account and kicked this one out.
+                console.log('⚠️  [Code 440] Session replaced! Another WhatsApp Web session is active.');
+                console.log('   ➜ Close WhatsApp Web in ALL browser tabs on this account.');
+                console.log('   ➜ Make sure only ONE instance of this bot is running.');
+                console.log('   ➜ Retrying in 15s — bot will reclaim the session automatically...');
+                reconnectAttempts = 0; // reset so next attempt starts at 15s flat
+                setTimeout(() => connectWhatsApp(), 15_000);
             } else {
                 // Exponential backoff: 5s, 10s, 20s, 40s, then cap at 60s
                 reconnectAttempts++;
