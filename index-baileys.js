@@ -77,7 +77,16 @@ async function discoverGroqModels() {
         if (res.ok) {
             const data = await res.json();
             const list = (data.data || []).map(m => m.id);
-            discoveredGroqModels = list.filter(m => !m.includes('whisper') && !m.includes('vision') && !m.includes('safetensors'));
+            // Only keep text chat/completion models — exclude classifiers, embedders, safety guards
+            discoveredGroqModels = list.filter(m =>
+                !m.includes('whisper') &&
+                !m.includes('vision') &&
+                !m.includes('safetensors') &&
+                !m.includes('guard') &&
+                !m.includes('embed') &&
+                !m.includes('moderation') &&
+                !m.includes('classifier')
+            );
             if (discoveredGroqModels.length > 0) {
                 console.log(`⚡ [Groq Engine] Active models on your account: ${discoveredGroqModels.slice(0, 4).join(', ')}`);
             }
@@ -350,7 +359,8 @@ const defaultGroqModels = [
     'llama-3.1-8b-instant'
 ].filter(Boolean);
 
-async function callGroqAPI(prompt, systemInstruction, activeAgent) {
+// messages = array of {role: 'user'|'assistant', content: string}
+async function callGroqAPI(messages, systemInstruction, activeAgent) {
     if (!GROQ_API_KEY) return null;
     const url = 'https://api.groq.com/openai/v1/chat/completions';
 
@@ -370,7 +380,7 @@ async function callGroqAPI(prompt, systemInstruction, activeAgent) {
                     model,
                     messages: [
                         { role: 'system', content: systemInstruction },
-                        { role: 'user', content: prompt }
+                        ...messages   // proper multi-turn history + current user message
                     ],
                     temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
                     max_tokens: 450
@@ -393,11 +403,12 @@ async function callGroqAPI(prompt, systemInstruction, activeAgent) {
 }
 
 // ─── Robust Multi-Provider AI Caller with Retries & Auto-Fallback ─────────────
-async function generateAIResponse(fullPrompt, systemInstruction, activeAgent) {
+// messages = array of {role: 'user'|'assistant', content: string}
+async function generateAIResponse(messages, systemInstruction, activeAgent) {
     // 1. Priority: Groq Cloud API (Free tier: 14,400 requests/day)
     if (GROQ_API_KEY) {
         try {
-            const text = await callGroqAPI(fullPrompt, systemInstruction, activeAgent);
+            const text = await callGroqAPI(messages, systemInstruction, activeAgent);
             if (text) return text;
         } catch (err) {
             console.error('⚠️  Groq request failed, falling back to Gemini:', err.message);
@@ -406,6 +417,12 @@ async function generateAIResponse(fullPrompt, systemInstruction, activeAgent) {
 
     // 2. Secondary: Google Gemini (With model cascade & key rotation)
     if (geminiKeys.length > 0) {
+        // Build Gemini-compatible contents array from messages
+        const geminiContents = messages.map(m => ({
+            role: m.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: m.content }]
+        }));
+
         for (const model of candidateGeminiModels) {
             for (let i = 0; i < geminiKeys.length; i++) {
                 const apiKey = geminiKeys[(currentGeminiKeyIndex + i) % geminiKeys.length];
@@ -413,7 +430,7 @@ async function generateAIResponse(fullPrompt, systemInstruction, activeAgent) {
                     const client = new GoogleGenAI({ apiKey });
                     const response = await client.models.generateContent({
                         model,
-                        contents: fullPrompt,
+                        contents: geminiContents,
                         config: {
                             systemInstruction,
                             temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
@@ -455,15 +472,23 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
 
     try {
         await sock.readMessages([originalMsg.key]);
-        const history = await getLastMessages(phoneNumber, 15);
+        const history = await getLastMessages(phoneNumber, 12);
         await recordMessage(phoneNumber, 'USER', combinedMessage);
 
-        let fullPrompt = '';
-        if (history.length > 0) {
-            fullPrompt += `--- CONTEXT (Last ${history.length} messages) ---\n`;
-            fullPrompt += history.join('\n') + '\n-----------------------------------\n\n';
+        // Parse history lines into proper multi-turn messages array
+        // Each line is: "[YYYY-MM-DD HH:MM] USER: text" or "[...] AI: text"
+        const messages = [];
+        for (const line of history) {
+            const match = line.match(/^\[[\d\- :]+\]\s+(USER|AI):\s+(.+)$/);
+            if (match) {
+                messages.push({
+                    role: match[1] === 'USER' ? 'user' : 'assistant',
+                    content: match[2].trim()
+                });
+            }
         }
-        fullPrompt += `USER: ${combinedMessage}\nAI:`;
+        // Add current user message as the latest turn
+        messages.push({ role: 'user', content: combinedMessage });
 
         // Human-like reading delay
         const wordCount = combinedMessage.split(/\s+/).length;
@@ -477,7 +502,7 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
         if (activeAgent === 'blopsy') systemInstruction = cachedPromptBlopsy;
         else if (activeAgent === 'manik') systemInstruction = cachedPromptManik;
 
-        let aiReply = await generateAIResponse(fullPrompt, systemInstruction, activeAgent);
+        let aiReply = await generateAIResponse(messages, systemInstruction, activeAgent);
 
         // 1. Detect Agent Switch (Orix -> Blopsy)
         if (aiReply.includes('[AGENT_SWITCH:blopsy]')) {
