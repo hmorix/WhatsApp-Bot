@@ -21,49 +21,61 @@ import pino from 'pino';
 import { connectDB, isMongoConnected } from './db.js';
 import { Settings } from './models/Settings.js';
 import { Message } from './models/Message.js';
+import { ContactSession } from './models/ContactSession.js';
+import { Interview } from './models/Interview.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // ─── Paths ───────────────────────────────────────────────────────────────────
 const CHATS_DIR = path.join(__dirname, 'chats');
-const SYSTEM_PROMPT_FILE = path.join(__dirname, 'system_prompt.txt');
+const AUTH_DIR = path.join(__dirname, 'baileys_auth');
 const ALLOWED_NUMBERS_FILE = path.join(__dirname, 'allowed_numbers.txt');
-const AUTH_DIR = path.join(__dirname, 'baileys_auth'); // session stored here (persistent)
+const PERSONAL_NUMBERS_FILE = path.join(__dirname, 'personal_numbers.txt');
+const SESSIONS_FILE = path.join(__dirname, 'contact_sessions.json');
+const INTERVIEWS_FILE = path.join(__dirname, 'scheduled_interviews.json');
+
+const PROMPT_MANIK_FILE = path.join(__dirname, 'system_prompt.txt');
+const PROMPT_ORIX_FILE = path.join(__dirname, 'system_prompt_orix.txt');
+const PROMPT_BLOPSY_FILE = path.join(__dirname, 'system_prompt_blopsy.txt');
 
 // ─── Ensure directories & files exist ────────────────────────────────────────
 for (const dir of [CHATS_DIR, AUTH_DIR]) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
-if (!fs.existsSync(SYSTEM_PROMPT_FILE)) {
-    fs.writeFileSync(SYSTEM_PROMPT_FILE, 'You are a helpful and polite virtual assistant for WhatsApp.', 'utf8');
-}
-if (!fs.existsSync(ALLOWED_NUMBERS_FILE)) {
-    fs.writeFileSync(ALLOWED_NUMBERS_FILE, '', 'utf8');
-}
+if (!fs.existsSync(ALLOWED_NUMBERS_FILE)) fs.writeFileSync(ALLOWED_NUMBERS_FILE, '*\n', 'utf8');
+if (!fs.existsSync(PERSONAL_NUMBERS_FILE)) fs.writeFileSync(PERSONAL_NUMBERS_FILE, '', 'utf8');
+if (!fs.existsSync(SESSIONS_FILE)) fs.writeFileSync(SESSIONS_FILE, '{}', 'utf8');
+if (!fs.existsSync(INTERVIEWS_FILE)) fs.writeFileSync(INTERVIEWS_FILE, '[]', 'utf8');
 
-// ─── In-memory settings ───────────────────────────────────────────────────────
-let cachedSystemPrompt = fs.readFileSync(SYSTEM_PROMPT_FILE, 'utf8');
-let cachedAllowedNumbers = fs
-    .readFileSync(ALLOWED_NUMBERS_FILE, 'utf8')
-    .split('\n')
-    .map(l => l.trim())
-    .filter(Boolean);
+// ─── In-memory Cache & Prompts ────────────────────────────────────────────────
+let cachedAllowedNumbers = fs.readFileSync(ALLOWED_NUMBERS_FILE, 'utf8').split('\n').map(l => l.trim()).filter(Boolean);
+let cachedPersonalNumbers = fs.readFileSync(PERSONAL_NUMBERS_FILE, 'utf8').split('\n').map(l => l.trim()).filter(l => Boolean(l) && !l.startsWith('#'));
+
+let cachedPromptManik = fs.existsSync(PROMPT_MANIK_FILE) ? fs.readFileSync(PROMPT_MANIK_FILE, 'utf8') : 'You are Manik, a real person talking over chat in friendly Hinglish.';
+let cachedPromptOrix = fs.existsSync(PROMPT_ORIX_FILE) ? fs.readFileSync(PROMPT_ORIX_FILE, 'utf8') : 'You are Orix, senior AI business consultant for HMorix (hmorix.in).';
+let cachedPromptBlopsy = fs.existsSync(PROMPT_BLOPSY_FILE) ? fs.readFileSync(PROMPT_BLOPSY_FILE, 'utf8') : 'You are Blopsy, talent acquisition & interview coordinator for HMorix (hmorix.in).';
+
+// Local fallbacks for sessions and interviews
+let localSessions = {};
+try { localSessions = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch (e) {}
+
+let localInterviews = [];
+try { localInterviews = JSON.parse(fs.readFileSync(INTERVIEWS_FILE, 'utf8')); } catch (e) {}
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
-// ─── Logging: silent Baileys output ──────────────────────────────────────────
 const logger = pino({ level: 'silent' });
 
-// ─── Helper: is user allowed? ─────────────────────────────────────────────────
+// ─── Message Queues per Sender (prevents dropped / overlapping messages) ─────
+const chatQueues = new Map(); // key: jid, value: { timeout, messages: [] }
+
+// ─── Helper: Allowed / Personal checks ───────────────────────────────────────
 function isAllowedUser(phoneNumber) {
-    // If explicitly configured to allow all or wildcard '*' or 'all' or empty list:
     if (process.env.ALLOW_ALL_NUMBERS === 'true') return true;
     if (!cachedAllowedNumbers.length || cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all')) {
         return true;
     }
-
     const cleanPhone = String(phoneNumber).replace(/[^0-9]/g, '');
     return cachedAllowedNumbers.some(n => {
         const cleanN = String(n).replace(/[^0-9]/g, '');
@@ -72,76 +84,142 @@ function isAllowedUser(phoneNumber) {
     });
 }
 
-// ─── Live File Watchers (Auto-Reload on Edit) ────────────────────────────────
-function setupFileWatchers() {
-    let allowedDebounce = null;
-    try {
-        fs.watch(ALLOWED_NUMBERS_FILE, () => {
-            clearTimeout(allowedDebounce);
-            allowedDebounce = setTimeout(async () => {
-                try {
-                    if (fs.existsSync(ALLOWED_NUMBERS_FILE)) {
-                        const content = fs.readFileSync(ALLOWED_NUMBERS_FILE, 'utf8');
-                        cachedAllowedNumbers = content
-                            .split('\n')
-                            .map(l => l.trim())
-                            .filter(Boolean);
+function isPersonalContact(phoneNumber) {
+    const cleanPhone = String(phoneNumber).replace(/[^0-9]/g, '');
+    return cachedPersonalNumbers.some(n => {
+        const cleanN = String(n).replace(/[^0-9]/g, '');
+        if (!cleanN) return false;
+        return cleanPhone.endsWith(cleanN) || cleanN.endsWith(cleanPhone) || cleanPhone === cleanN;
+    });
+}
 
-                        const allowAll = !cachedAllowedNumbers.length || cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all');
-                        console.log(`\n🔄 [Auto-Reload] allowed_numbers.txt updated live!`);
-                        if (allowAll) {
-                            console.log(`🌟 Mode: ALL numbers allowed! (Every contact receives AI responses)`);
-                        } else {
-                            console.log(`🔒 Mode: Whitelist active. Allowed: [${cachedAllowedNumbers.join(', ')}]`);
-                        }
-
-                        if (isMongoConnected()) {
-                            await Settings.findOneAndUpdate(
-                                { key: 'global_config' },
-                                { allowedNumbers: cachedAllowedNumbers, updatedAt: new Date() }
-                            );
-                            console.log('☁️ Synced updated allowed numbers to MongoDB.');
-                        }
-                    }
-                } catch (err) {
-                    console.error('⚠️  Failed to reload allowed_numbers.txt:', err.message);
-                }
-            }, 300);
-        });
-        console.log('👀 Watching allowed_numbers.txt for live changes (auto-reload active)');
-    } catch (e) {
-        console.warn('⚠️  Could not watch allowed_numbers.txt:', e.message);
+// ─── Session Management (Agent Routing: Orix vs Blopsy vs Manik) ────────────
+async function getActiveAgent(phoneNumber) {
+    // 1. Personal contact list always routes to Manik
+    if (isPersonalContact(phoneNumber)) {
+        return 'manik';
     }
 
-    let promptDebounce = null;
-    try {
-        fs.watch(SYSTEM_PROMPT_FILE, () => {
-            clearTimeout(promptDebounce);
-            promptDebounce = setTimeout(async () => {
-                try {
-                    if (fs.existsSync(SYSTEM_PROMPT_FILE)) {
-                        cachedSystemPrompt = fs.readFileSync(SYSTEM_PROMPT_FILE, 'utf8');
-                        console.log('\n🔄 [Auto-Reload] system_prompt.txt updated live!');
-                        if (isMongoConnected()) {
-                            await Settings.findOneAndUpdate(
-                                { key: 'global_config' },
-                                { systemPrompt: cachedSystemPrompt, updatedAt: new Date() }
-                            );
-                            console.log('☁️ Synced updated system prompt to MongoDB.');
-                        }
-                    }
-                } catch (err) {
-                    console.error('⚠️  Failed to reload system_prompt.txt:', err.message);
-                }
-            }, 300);
-        });
-        console.log('👀 Watching system_prompt.txt for live changes (auto-reload active)');
-    } catch (e) {
-        console.warn('⚠️  Could not watch system_prompt.txt:', e.message);
+    // 2. Check MongoDB session
+    if (isMongoConnected()) {
+        try {
+            const doc = await ContactSession.findOne({ phoneNumber });
+            if (doc && doc.activeAgent) return doc.activeAgent;
+        } catch (e) {}
+    }
+
+    // 3. Fallback to local session
+    if (localSessions[phoneNumber] && localSessions[phoneNumber].activeAgent) {
+        return localSessions[phoneNumber].activeAgent;
+    }
+
+    // 4. Default business agent: Orix
+    return 'orix';
+}
+
+async function setContactSession(phoneNumber, activeAgent, leadType = 'unknown') {
+    localSessions[phoneNumber] = { activeAgent, leadType, updatedAt: new Date().toISOString() };
+    try { fs.writeFileSync(SESSIONS_FILE, JSON.stringify(localSessions, null, 2), 'utf8'); } catch (e) {}
+
+    if (isMongoConnected()) {
+        try {
+            await ContactSession.findOneAndUpdate(
+                { phoneNumber },
+                { activeAgent, leadType, updatedAt: new Date() },
+                { upsert: true }
+            );
+        } catch (e) {}
     }
 }
 
-// ─── Helper: get last N messages ─────────────────────────────────────────────
+// ─── Interview Management & Automated Reminders (2h, 1h, 15m) ────────────────
+async function recordScheduledInterview(phoneNumber, dateStr) {
+    try {
+        const scheduledTime = new Date(dateStr);
+        if (isNaN(scheduledTime.getTime())) return;
+
+        const record = {
+            phoneNumber,
+            scheduledTime,
+            status: 'scheduled',
+            reminded2h: false,
+            reminded1h: false,
+            reminded15m: false,
+            createdAt: new Date()
+        };
+
+        localInterviews.push(record);
+        try { fs.writeFileSync(INTERVIEWS_FILE, JSON.stringify(localInterviews, null, 2), 'utf8'); } catch (e) {}
+
+        if (isMongoConnected()) {
+            await Interview.create(record);
+        }
+        console.log(`📅 [Interview Scheduled] Confirmed for ${phoneNumber} at: ${scheduledTime.toLocaleString('en-IN')}`);
+    } catch (e) {
+        console.error('Failed to schedule interview:', e.message);
+    }
+}
+
+function startReminderWorker(sock) {
+    // Checks every 60 seconds for interviews needing reminders
+    setInterval(async () => {
+        const now = Date.now();
+
+        let interviews = localInterviews;
+        if (isMongoConnected()) {
+            try {
+                interviews = await Interview.find({ status: 'scheduled' });
+            } catch (e) {
+                interviews = localInterviews;
+            }
+        }
+
+        for (const item of interviews) {
+            const interviewTime = new Date(item.scheduledTime).getTime();
+            const timeDiffMs = interviewTime - now;
+            const minutesLeft = Math.round(timeDiffMs / (60 * 1000));
+            const jid = item.phoneNumber.includes('@') ? item.phoneNumber : `${item.phoneNumber}@s.whatsapp.net`;
+
+            // 2 Hours Reminder (between 115 and 125 minutes)
+            if (minutesLeft > 60 && minutesLeft <= 125 && !item.reminded2h) {
+                const text = `👋 Hello! Gentle reminder from Blopsy at HMorix:\nYour scheduled interview is in approximately 2 hours (${new Date(item.scheduledTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}).\nPlease make sure you are in a quiet room with stable internet connection. All the best! ✨`;
+                try {
+                    await sock.sendMessage(jid, { text });
+                    item.reminded2h = true;
+                    if (item.save) await item.save();
+                    try { fs.writeFileSync(INTERVIEWS_FILE, JSON.stringify(localInterviews, null, 2), 'utf8'); } catch (e) {}
+                    console.log(`⏰ [Reminder Sent] 2-Hour reminder delivered to ${item.phoneNumber}`);
+                } catch (e) {}
+            }
+
+            // 1 Hour Reminder (between 50 and 65 minutes)
+            if (minutesLeft > 20 && minutesLeft <= 65 && !item.reminded1h) {
+                const text = `⏰ Reminder from HMorix (Blopsy):\nYour interview is coming up in 1 hour! Feel free to review our services at https://hmorix.in before we chat. See you soon!`;
+                try {
+                    await sock.sendMessage(jid, { text });
+                    item.reminded1h = true;
+                    if (item.save) await item.save();
+                    try { fs.writeFileSync(INTERVIEWS_FILE, JSON.stringify(localInterviews, null, 2), 'utf8'); } catch (e) {}
+                    console.log(`⏰ [Reminder Sent] 1-Hour reminder delivered to ${item.phoneNumber}`);
+                } catch (e) {}
+            }
+
+            // 15 Minutes Reminder (between 5 and 18 minutes)
+            if (minutesLeft >= 0 && minutesLeft <= 18 && !item.reminded15m) {
+                const text = `🚀 Final reminder: Your interview with HMorix begins in 15 minutes! Please be ready. We are excited to meet you!`;
+                try {
+                    await sock.sendMessage(jid, { text });
+                    item.reminded15m = true;
+                    if (item.save) await item.save();
+                    try { fs.writeFileSync(INTERVIEWS_FILE, JSON.stringify(localInterviews, null, 2), 'utf8'); } catch (e) {}
+                    console.log(`⏰ [Reminder Sent] 15-Minute reminder delivered to ${item.phoneNumber}`);
+                } catch (e) {}
+            }
+        }
+    }, 60 * 1000);
+}
+
+// ─── Chat History ─────────────────────────────────────────────────────────────
 async function getLastMessages(phoneNumber, limit = 15) {
     if (isMongoConnected()) {
         try {
@@ -153,9 +231,7 @@ async function getLastMessages(phoneNumber, limit = 15) {
                 const timeStr = new Date(d.timestamp).toISOString().replace('T', ' ').slice(0, 16);
                 return `[${timeStr}] ${d.role}: ${d.message}`;
             });
-        } catch (e) {
-            console.error('Error fetching from MongoDB:', e.message);
-        }
+        } catch (e) {}
     }
     const filePath = path.join(CHATS_DIR, `${phoneNumber}.txt`);
     if (!fs.existsSync(filePath)) return [];
@@ -163,15 +239,12 @@ async function getLastMessages(phoneNumber, limit = 15) {
     return lines.slice(-limit);
 }
 
-// ─── Helper: record message ───────────────────────────────────────────────────
 async function recordMessage(phoneNumber, role, messageText) {
     const cleanMessage = messageText.replace(/\n/g, ' ');
     if (isMongoConnected()) {
         try {
             await Message.create({ phoneNumber, role, message: cleanMessage, timestamp: new Date() });
-        } catch (e) {
-            console.error('Failed to log to MongoDB:', e.message);
-        }
+        } catch (e) {}
     }
     try {
         const filePath = path.join(CHATS_DIR, `${phoneNumber}.txt`);
@@ -180,45 +253,158 @@ async function recordMessage(phoneNumber, role, messageText) {
     } catch (e) {}
 }
 
-// ─── Sync MongoDB settings ────────────────────────────────────────────────────
-async function syncDatabase() {
-    if (!isMongoConnected()) return;
-    try {
-        let config = await Settings.findOne({ key: 'global_config' });
-        if (!config) {
-            await Settings.create({
-                key: 'global_config',
-                systemPrompt: cachedSystemPrompt,
-                allowedNumbers: cachedAllowedNumbers,
+// ─── Live File Watchers ───────────────────────────────────────────────────────
+function setupFileWatchers() {
+    const watchWithDebounce = (filePath, onUpdate) => {
+        let debounceTimer = null;
+        try {
+            fs.watch(filePath, () => {
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => {
+                    try {
+                        if (fs.existsSync(filePath)) onUpdate();
+                    } catch (e) {}
+                }, 300);
             });
-            console.log('✅ MongoDB Settings initialized.');
-        } else {
-            // If local allowed numbers has '*' or 'all' (allow everyone), persist to MongoDB
-            if (cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all')) {
-                await Settings.findOneAndUpdate(
-                    { key: 'global_config' },
-                    { allowedNumbers: cachedAllowedNumbers, updatedAt: new Date() }
-                );
-                console.log('✅ Synchronized settings: ALLOW ALL numbers (*) active.');
-            } else if (config.allowedNumbers && config.allowedNumbers.length > 0 && !cachedAllowedNumbers.length) {
-                cachedAllowedNumbers = config.allowedNumbers;
-                fs.writeFileSync(ALLOWED_NUMBERS_FILE, cachedAllowedNumbers.join('\n'), 'utf8');
-                console.log('✅ Synced settings from MongoDB.');
-            }
-            cachedSystemPrompt = config.systemPrompt || cachedSystemPrompt;
-            fs.writeFileSync(SYSTEM_PROMPT_FILE, cachedSystemPrompt, 'utf8');
+            console.log(`👀 Watching ${path.basename(filePath)} (live auto-reload enabled)`);
+        } catch (e) {}
+    };
+
+    watchWithDebounce(ALLOWED_NUMBERS_FILE, () => {
+        cachedAllowedNumbers = fs.readFileSync(ALLOWED_NUMBERS_FILE, 'utf8').split('\n').map(l => l.trim()).filter(Boolean);
+        const allowAll = !cachedAllowedNumbers.length || cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all');
+        console.log(`\n🔄 [Auto-Reload] allowed_numbers.txt updated! ${allowAll ? '🌟 Mode: ALL numbers allowed' : `🔒 Whitelist: [${cachedAllowedNumbers.join(', ')}]`}`);
+    });
+
+    watchWithDebounce(PERSONAL_NUMBERS_FILE, () => {
+        cachedPersonalNumbers = fs.readFileSync(PERSONAL_NUMBERS_FILE, 'utf8').split('\n').map(l => l.trim()).filter(l => Boolean(l) && !l.startsWith('#'));
+        console.log(`\n🔄 [Auto-Reload] personal_numbers.txt updated! (Manik persona assigned to: ${cachedPersonalNumbers.join(', ') || 'none'})`);
+    });
+
+    watchWithDebounce(PROMPT_ORIX_FILE, () => {
+        cachedPromptOrix = fs.readFileSync(PROMPT_ORIX_FILE, 'utf8');
+        console.log('\n🔄 [Auto-Reload] system_prompt_orix.txt updated!');
+    });
+
+    watchWithDebounce(PROMPT_BLOPSY_FILE, () => {
+        cachedPromptBlopsy = fs.readFileSync(PROMPT_BLOPSY_FILE, 'utf8');
+        console.log('\n🔄 [Auto-Reload] system_prompt_blopsy.txt updated!');
+    });
+
+    watchWithDebounce(PROMPT_MANIK_FILE, () => {
+        cachedPromptManik = fs.readFileSync(PROMPT_MANIK_FILE, 'utf8');
+        console.log('\n🔄 [Auto-Reload] system_prompt.txt (Manik) updated!');
+    });
+}
+
+// ─── Robust Gemini Caller with Retries & Safe Fallback ────────────────────────
+async function generateAIResponse(fullPrompt, systemInstruction, activeAgent) {
+    const maxRetries = 2;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const response = await ai.models.generateContent({
+                model: GEMINI_MODEL,
+                contents: fullPrompt,
+                config: {
+                    systemInstruction,
+                    temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
+                    maxOutputTokens: 400,
+                },
+            });
+            const text = response.text ? response.text.trim() : '';
+            if (text) return text;
+        } catch (err) {
+            console.error(`⚠️  Gemini API attempt ${attempt} failed:`, err.message || err);
+            if (attempt < maxRetries) await new Promise(r => setTimeout(r, 1200));
         }
-    } catch (err) {
-        console.error('⚠️  MongoDB sync failed:', err.message);
+    }
+
+    // Graceful fallback response depending on active agent
+    if (activeAgent === 'orix') {
+        return "Haan ji, main sun raha hun! Thoda sa connection glitch tha. HMorix ke products (BillingFlow, AI Agents, Web/App Development) ke baare mein aapko kya jaanna hai?";
+    } else if (activeAgent === 'blopsy') {
+        return "Hi! Main sun rahi hun, connection thoda slow tha. Aap kis role ke liye apply karna chahte hain? Please share karein!";
+    } else {
+        return "Haan yrr sun raha hun, bata kya scene hai?";
     }
 }
 
-// ─── Main WhatsApp connection ─────────────────────────────────────────────────
+// ─── Process Aggregated Incoming Messages ─────────────────────────────────────
+async function processUserMessages(sock, jid, phoneNumber, combinedMessage, originalMsg) {
+    if (!isAllowedUser(phoneNumber)) {
+        console.log(`🔒 Ignored message from ${phoneNumber} (not in allowed list)`);
+        return;
+    }
+
+    const activeAgent = await getActiveAgent(phoneNumber);
+    const agentLabel = activeAgent === 'orix' ? '💼 ORIX (Smart Tech AI)' : activeAgent === 'blopsy' ? '👩‍💼 BLOPSY (HR)' : '👦 MANIK (Personal)';
+    console.log(`\n📩 Message from ${phoneNumber} [Assigned: ${agentLabel}]:\n   "${combinedMessage}"`);
+
+    try {
+        await sock.readMessages([originalMsg.key]);
+        const history = await getLastMessages(phoneNumber, 15);
+        await recordMessage(phoneNumber, 'USER', combinedMessage);
+
+        let fullPrompt = '';
+        if (history.length > 0) {
+            fullPrompt += `--- CONTEXT (Last ${history.length} messages) ---\n`;
+            fullPrompt += history.join('\n') + '\n-----------------------------------\n\n';
+        }
+        fullPrompt += `USER: ${combinedMessage}\nAI:`;
+
+        // Human-like reading delay
+        const wordCount = combinedMessage.split(/\s+/).length;
+        const readingDelayMs = Math.min(3000, Math.max(1500, wordCount * 250));
+        console.log(`🤔 Reading for ${Math.round(readingDelayMs / 1000)}s...`);
+        await new Promise(r => setTimeout(r, readingDelayMs));
+
+        await sock.sendPresenceUpdate('composing', jid);
+
+        let systemInstruction = cachedPromptOrix;
+        if (activeAgent === 'blopsy') systemInstruction = cachedPromptBlopsy;
+        else if (activeAgent === 'manik') systemInstruction = cachedPromptManik;
+
+        let aiReply = await generateAIResponse(fullPrompt, systemInstruction, activeAgent);
+
+        // 1. Detect Agent Switch (Orix -> Blopsy)
+        if (aiReply.includes('[AGENT_SWITCH:blopsy]')) {
+            aiReply = aiReply.replace(/\[AGENT_SWITCH:blopsy\]/gi, '').trim();
+            await setContactSession(phoneNumber, 'blopsy', 'candidate');
+            console.log(`🔀 [Auto-Handshake] Handed off contact ${phoneNumber} from Orix to BLOPSY (HR)!`);
+        }
+
+        // 2. Detect Scheduled Interview [INTERVIEW_SCHEDULED:YYYY-MM-DD HH:MM]
+        const scheduleMatch = aiReply.match(/\[INTERVIEW_SCHEDULED:([\d\-]+ [\d:]+)\]/i);
+        if (scheduleMatch) {
+            const dateTimeStr = scheduleMatch[1];
+            aiReply = aiReply.replace(/\[INTERVIEW_SCHEDULED:[\d\-]+ [\d:]+\]/gi, '').trim();
+            await recordScheduledInterview(phoneNumber, dateTimeStr);
+        }
+
+        // Typing delay simulation
+        const responseWordCount = aiReply.split(/\s+/).length;
+        const typingDelayMs = Math.min(4500, Math.max(1800, responseWordCount * 300));
+        console.log(`⏳ Typing for ${Math.round(typingDelayMs / 1000)}s...`);
+        await new Promise(r => setTimeout(r, typingDelayMs));
+
+        await sock.sendPresenceUpdate('paused', jid);
+        await sock.sendMessage(jid, { text: aiReply }, { quoted: originalMsg });
+        console.log(`🤖 Replied to ${phoneNumber} [${agentLabel}]:\n   "${aiReply}"`);
+
+        await recordMessage(phoneNumber, 'AI', aiReply);
+
+    } catch (err) {
+        console.error(`❌ Error responding to ${phoneNumber}:`, err.message || err);
+        try { await sock.sendPresenceUpdate('paused', jid); } catch (e) {}
+    }
+}
+
+// ─── Main WhatsApp Connection ─────────────────────────────────────────────────
 async function connectWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
-    console.log(`\n📦 Using WA Web v${version.join('.')}`);
+    console.log(`📦 Using WA Web v${version.join('.')}`);
 
     const sock = makeWASocket({
         version,
@@ -232,10 +418,8 @@ async function connectWhatsApp() {
         markOnlineOnConnect: true,
     });
 
-    // Save credentials whenever they update (persistent login)
     sock.ev.on('creds.update', saveCreds);
 
-    // ─── Connection state handler ─────────────────────────────────────────────
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
@@ -255,7 +439,6 @@ async function connectWhatsApp() {
                 console.log('🔒 Logged out! Clearing saved session...');
                 fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 fs.mkdirSync(AUTH_DIR, { recursive: true });
-                console.log('🔄 Restart the bot to scan QR again.');
                 process.exit(1);
             } else {
                 console.log('🔄 Reconnecting in 5 seconds...');
@@ -264,153 +447,94 @@ async function connectWhatsApp() {
         }
 
         if (connection === 'open') {
-            console.log('\n✅ WhatsApp connected! Bot is live.\n');
-            console.log('   Session saved to ./baileys_auth — no QR needed on next start.');
-            console.log('   Press Ctrl+C to stop.\n');
+            console.log('\n✅ WhatsApp Connected! HMorix Multi-Agent Bot is LIVE.\n');
+            console.log('   Agents active:');
+            console.log('   • 💼 ORIX Smart Tech AI (Sales, Pricing, HMorix Services, Client Qualification)');
+            console.log('   • 👩‍💼 BLOPSY (HR, Candidate Screening, Interview Scheduler & 2h/1h/15m Reminders)');
+            console.log('   • 👦 MANIK (Personal Hinglish Friend - strictly for personal_numbers.txt)');
+            console.log('\n   Press Ctrl+C to stop.\n');
         }
     });
 
-    // ─── Incoming message handler ─────────────────────────────────────────────
+    // ─── Incoming Message Debounce / Aggregator ────────────────────────────────
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
-            if (!msg.message) continue;
-            if (!msg.key.remoteJid) continue;
+            if (!msg.message || !msg.key.remoteJid) continue;
             if (isJidBroadcast(msg.key.remoteJid)) continue;
-            if (msg.key.remoteJid.endsWith('@g.us')) continue;  // skip groups
-            if (msg.key.fromMe) continue;                        // skip own messages
+            if (msg.key.remoteJid.endsWith('@g.us')) continue; // skip group chats
+            if (msg.key.fromMe) continue; // skip self messages
 
             const jid = msg.key.remoteJid;
-
-            // Resolve real phone number — newer WhatsApp uses LID (@lid) instead of phone numbers
-            // Try to get the real number from verifiedBizName, notify, or pushName fallbacks
             let phoneNumber = jid.split('@')[0];
 
-            // If this is a LID (not a real phone number), try to get the actual number
+            // LID or PushName candidate resolution
             if (jid.endsWith('@lid') || !/^\d{7,15}$/.test(phoneNumber)) {
-                // Try from message's pushName/notify or sender number fields
-                const senderJid =
-                    msg.key.participant ||
-                    msg.participant ||
-                    '';
+                const senderJid = msg.key.participant || msg.participant || '';
                 if (senderJid && senderJid.includes('@')) {
                     const candidate = senderJid.split('@')[0];
-                    if (/^\d{7,15}$/.test(candidate)) {
-                        phoneNumber = candidate;
-                    }
-                }
-                // Still a LID? Try verifiedBizName or notify in message
-                if (!/^\d{7,15}$/.test(phoneNumber)) {
-                    const notify = msg.pushName || '';
-                    console.log(`⚠️  LID contact detected (${jid.split('@')[0]}). Add their number manually to allowed_numbers.txt if needed.`);
+                    if (/^\d{7,15}$/.test(candidate)) phoneNumber = candidate;
                 }
             }
 
-            // Extract text from different message types
-            const userMessage =
+            const text =
                 msg.message?.conversation ||
                 msg.message?.extendedTextMessage?.text ||
                 msg.message?.imageMessage?.caption ||
                 msg.message?.videoMessage?.caption ||
                 '';
 
-            if (!userMessage.trim()) continue;
+            if (!text.trim()) continue;
 
-            // Allowed number check
-            if (!isAllowedUser(phoneNumber)) {
-                console.log(`🔒 Ignored message from ${phoneNumber} (not in allowed list)`);
-                continue;
+            // Debounce aggregation: If user sends 2-3 quick messages, combine them!
+            if (!chatQueues.has(jid)) {
+                chatQueues.set(jid, { texts: [text], originalMsg: msg });
+            } else {
+                const queue = chatQueues.get(jid);
+                queue.texts.push(text);
+                queue.originalMsg = msg; // use latest message for quoting
+                if (queue.timeout) clearTimeout(queue.timeout);
             }
 
-            console.log(`\n📩 Message from ${phoneNumber}: ${userMessage}`);
-
-            try {
-                // Mark message as read (show blue ticks)
-                await sock.readMessages([msg.key]);
-
-                // Get conversation history
-                const history = await getLastMessages(phoneNumber, 15);
-
-                // Record incoming message
-                await recordMessage(phoneNumber, 'USER', userMessage);
-
-                // Build Gemini prompt with history
-                let fullPrompt = '';
-                if (history.length > 0) {
-                    fullPrompt += `--- CONTEXT (Last ${history.length} messages) ---\n`;
-                    fullPrompt += history.join('\n') + '\n-----------------------------------\n\n';
-                }
-                fullPrompt += `USER: ${userMessage}\nAI:`;
-
-                // Simulate reading delay
-                const wordCount = userMessage.split(/\s+/).length;
-                const readingDelayMs = Math.max(1500, wordCount * 300);
-                console.log(`🤔 Reading for ${Math.round(readingDelayMs / 1000)}s...`);
-                await new Promise(r => setTimeout(r, readingDelayMs));
-
-                // Show "typing..." indicator
-                await sock.sendPresenceUpdate('composing', jid);
-
-                // Call Gemini AI
-                const response = await ai.models.generateContent({
-                    model: GEMINI_MODEL,
-                    contents: fullPrompt,
-                    config: {
-                        systemInstruction: cachedSystemPrompt,
-                        temperature: 0.9,
-                        maxOutputTokens: 60,
-                    },
-                });
-                const aiResponse = response.text ? response.text.trim() : '';
-
-                if (!aiResponse) {
-                    await sock.sendPresenceUpdate('paused', jid);
-                    continue;
-                }
-
-                // Simulate typing delay based on response length
-                const responseWordCount = aiResponse.split(/\s+/).length;
-                const typingDelayMs = Math.max(2000, responseWordCount * 500);
-                console.log(`⏳ Typing for ${Math.round(typingDelayMs / 1000)}s...`);
-                await new Promise(r => setTimeout(r, typingDelayMs));
-
-                // Stop typing indicator
-                await sock.sendPresenceUpdate('paused', jid);
-
-                // Send reply (quoted to original message)
-                await sock.sendMessage(jid, { text: aiResponse }, { quoted: msg });
-                console.log(`🤖 Replied to ${phoneNumber}: ${aiResponse}`);
-
-                // Record AI response
-                await recordMessage(phoneNumber, 'AI', aiResponse);
-
-            } catch (err) {
-                console.error(`❌ Error handling message from ${phoneNumber}:`, err.message || err);
-                try { await sock.sendPresenceUpdate('paused', jid); } catch (e) {}
-            }
+            const queue = chatQueues.get(jid);
+            queue.timeout = setTimeout(async () => {
+                const combined = queue.texts.join('\n');
+                const lastMsg = queue.originalMsg;
+                chatQueues.delete(jid);
+                await processUserMessages(sock, jid, phoneNumber, combined, lastMsg);
+            }, 2500); // wait 2.5 seconds for user to stop typing
         }
     });
+
+    // Start background interview reminder worker
+    startReminderWorker(sock);
 
     return sock;
 }
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 async function main() {
-    console.log('\n🚀 WhatsApp AI Bot — Baileys Edition (Termux-friendly)');
+    console.log('\n🚀 HMorix Intelligent Multi-Agent WhatsApp System');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
     await connectDB(process.env.MONGODB_URI);
-    await syncDatabase();
     setupFileWatchers();
 
     const allowAll = !cachedAllowedNumbers.length || cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all') || process.env.ALLOW_ALL_NUMBERS === 'true';
     if (allowAll) {
-        console.log('🌟 Mode: ALL numbers allowed! (Every contact receives AI responses)\n');
+        console.log('🌟 Mode: ALL numbers allowed! (Every contact receives AI responses)');
     } else {
-        console.log(`🔒 Mode: Whitelist active. Allowed: [${cachedAllowedNumbers.join(', ')}]\n`);
+        console.log(`🔒 Mode: Whitelist active. Allowed: [${cachedAllowedNumbers.join(', ')}]`);
     }
 
+    if (cachedPersonalNumbers.length > 0) {
+        console.log(`👦 Personal Contacts (Manik persona): ${cachedPersonalNumbers.join(', ')}`);
+    } else {
+        console.log('ℹ️  No personal numbers configured in personal_numbers.txt (Everyone routes to Orix by default).');
+    }
+
+    console.log('\n');
     await connectWhatsApp();
 }
 
@@ -419,7 +543,6 @@ main().catch(err => {
     process.exit(1);
 });
 
-// Graceful shutdown
 process.on('SIGINT', () => {
     console.log('\n\n🛑 Bot stopped. Session saved — restart anytime without re-scanning QR.');
     process.exit(0);
