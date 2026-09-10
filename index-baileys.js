@@ -513,6 +513,9 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
 }
 
 // ─── Main WhatsApp Connection ─────────────────────────────────────────────────
+let reconnectAttempts = 0;
+let reminderWorkerStarted = false;
+
 async function connectWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
@@ -529,6 +532,10 @@ async function connectWhatsApp() {
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
         markOnlineOnConnect: true,
+        keepAliveIntervalMs: 25_000,       // ping WA every 25s to prevent 408 timeouts
+        connectTimeoutMs: 60_000,          // allow up to 60s for initial connect
+        retryRequestDelayMs: 2_000,        // wait 2s before retrying a failed request
+        browser: ['HMorix Bot', 'Chrome', '125.0.0'],
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -553,13 +560,25 @@ async function connectWhatsApp() {
                 fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 fs.mkdirSync(AUTH_DIR, { recursive: true });
                 process.exit(1);
+            } else if (code === 428) {
+                // 428 = Precondition Required — WA is rejecting the session key state.
+                // Clearing auth forces a clean re-registration on next start.
+                console.log('⚠️  Session rejected by WhatsApp (code 428). Clearing stale auth & exiting.');
+                console.log('   ➜ Restart the bot and re-scan the QR code.');
+                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                fs.mkdirSync(AUTH_DIR, { recursive: true });
+                process.exit(1);
             } else {
-                console.log('🔄 Reconnecting in 5 seconds...');
-                setTimeout(() => connectWhatsApp(), 5000);
+                // Exponential backoff: 5s, 10s, 20s, 40s, then cap at 60s
+                reconnectAttempts++;
+                const delayMs = Math.min(5000 * Math.pow(2, reconnectAttempts - 1), 60_000);
+                console.log(`🔄 Reconnecting in ${Math.round(delayMs / 1000)}s... (attempt ${reconnectAttempts})`);
+                setTimeout(() => connectWhatsApp(), delayMs);
             }
         }
 
         if (connection === 'open') {
+            reconnectAttempts = 0; // reset backoff on successful connect
             console.log('\n✅ WhatsApp Connected! HMorix Multi-Agent Bot is LIVE.\n');
             console.log('   Agents active:');
             console.log('   • 💼 ORIX Smart Tech AI (Sales, Pricing, HMorix Services, Client Qualification)');
@@ -620,8 +639,11 @@ async function connectWhatsApp() {
         }
     });
 
-    // Start background interview reminder worker
-    startReminderWorker(sock);
+    // Start background interview reminder worker (only once, not on every reconnect)
+    if (!reminderWorkerStarted) {
+        startReminderWorker(sock);
+        reminderWorkerStarted = true;
+    }
 
     return sock;
 }
