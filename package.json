@@ -2,10 +2,9 @@
   "name": "whats-app-ai-asit",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.js",
+  "main": "index-baileys.js",
   "scripts": {
-    "start": "node index.js",
-    "start:baileys": "node index-baileys.js",
+    "start": "node index-baileys.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -16,13 +15,8 @@
     "@google/genai": "^2.3.0",
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^6.7.16",
-    "cookie-parser": "^1.4.6",
     "dotenv": "^17.4.2",
-    "express": "^4.19.2",
     "mongoose": "^8.5.0",
-    "pino": "^9.7.0",
-    "qrcode": "^1.5.3",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.34.7"
+    "pino": "^9.7.0"
   }
 }
