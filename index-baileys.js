@@ -194,7 +194,30 @@ async function connectWhatsApp() {
             if (msg.key.fromMe) continue;                        // skip own messages
 
             const jid = msg.key.remoteJid;
-            const phoneNumber = jid.split('@')[0];
+
+            // Resolve real phone number — newer WhatsApp uses LID (@lid) instead of phone numbers
+            // Try to get the real number from verifiedBizName, notify, or pushName fallbacks
+            let phoneNumber = jid.split('@')[0];
+
+            // If this is a LID (not a real phone number), try to get the actual number
+            if (jid.endsWith('@lid') || !/^\d{7,15}$/.test(phoneNumber)) {
+                // Try from message's pushName/notify or sender number fields
+                const senderJid =
+                    msg.key.participant ||
+                    msg.participant ||
+                    '';
+                if (senderJid && senderJid.includes('@')) {
+                    const candidate = senderJid.split('@')[0];
+                    if (/^\d{7,15}$/.test(candidate)) {
+                        phoneNumber = candidate;
+                    }
+                }
+                // Still a LID? Try verifiedBizName or notify in message
+                if (!/^\d{7,15}$/.test(phoneNumber)) {
+                    const notify = msg.pushName || '';
+                    console.log(`⚠️  LID contact detected (${jid.split('@')[0]}). Add their number manually to allowed_numbers.txt if needed.`);
+                }
+            }
 
             // Extract text from different message types
             const userMessage =
