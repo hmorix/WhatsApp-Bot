@@ -58,8 +58,87 @@ const logger = pino({ level: 'silent' });
 
 // ─── Helper: is user allowed? ─────────────────────────────────────────────────
 function isAllowedUser(phoneNumber) {
-    if (!cachedAllowedNumbers.length) return true; // empty list = allow all
-    return cachedAllowedNumbers.some(n => phoneNumber.endsWith(n));
+    // If explicitly configured to allow all or wildcard '*' or 'all' or empty list:
+    if (process.env.ALLOW_ALL_NUMBERS === 'true') return true;
+    if (!cachedAllowedNumbers.length || cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all')) {
+        return true;
+    }
+
+    const cleanPhone = String(phoneNumber).replace(/[^0-9]/g, '');
+    return cachedAllowedNumbers.some(n => {
+        const cleanN = String(n).replace(/[^0-9]/g, '');
+        if (!cleanN) return false;
+        return cleanPhone.endsWith(cleanN) || cleanN.endsWith(cleanPhone) || cleanPhone === cleanN;
+    });
+}
+
+// ─── Live File Watchers (Auto-Reload on Edit) ────────────────────────────────
+function setupFileWatchers() {
+    let allowedDebounce = null;
+    try {
+        fs.watch(ALLOWED_NUMBERS_FILE, () => {
+            clearTimeout(allowedDebounce);
+            allowedDebounce = setTimeout(async () => {
+                try {
+                    if (fs.existsSync(ALLOWED_NUMBERS_FILE)) {
+                        const content = fs.readFileSync(ALLOWED_NUMBERS_FILE, 'utf8');
+                        cachedAllowedNumbers = content
+                            .split('\n')
+                            .map(l => l.trim())
+                            .filter(Boolean);
+
+                        const allowAll = !cachedAllowedNumbers.length || cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all');
+                        console.log(`\n🔄 [Auto-Reload] allowed_numbers.txt updated live!`);
+                        if (allowAll) {
+                            console.log(`🌟 Mode: ALL numbers allowed! (Every contact receives AI responses)`);
+                        } else {
+                            console.log(`🔒 Mode: Whitelist active. Allowed: [${cachedAllowedNumbers.join(', ')}]`);
+                        }
+
+                        if (isMongoConnected()) {
+                            await Settings.findOneAndUpdate(
+                                { key: 'global_config' },
+                                { allowedNumbers: cachedAllowedNumbers, updatedAt: new Date() }
+                            );
+                            console.log('☁️ Synced updated allowed numbers to MongoDB.');
+                        }
+                    }
+                } catch (err) {
+                    console.error('⚠️  Failed to reload allowed_numbers.txt:', err.message);
+                }
+            }, 300);
+        });
+        console.log('👀 Watching allowed_numbers.txt for live changes (auto-reload active)');
+    } catch (e) {
+        console.warn('⚠️  Could not watch allowed_numbers.txt:', e.message);
+    }
+
+    let promptDebounce = null;
+    try {
+        fs.watch(SYSTEM_PROMPT_FILE, () => {
+            clearTimeout(promptDebounce);
+            promptDebounce = setTimeout(async () => {
+                try {
+                    if (fs.existsSync(SYSTEM_PROMPT_FILE)) {
+                        cachedSystemPrompt = fs.readFileSync(SYSTEM_PROMPT_FILE, 'utf8');
+                        console.log('\n🔄 [Auto-Reload] system_prompt.txt updated live!');
+                        if (isMongoConnected()) {
+                            await Settings.findOneAndUpdate(
+                                { key: 'global_config' },
+                                { systemPrompt: cachedSystemPrompt, updatedAt: new Date() }
+                            );
+                            console.log('☁️ Synced updated system prompt to MongoDB.');
+                        }
+                    }
+                } catch (err) {
+                    console.error('⚠️  Failed to reload system_prompt.txt:', err.message);
+                }
+            }, 300);
+        });
+        console.log('👀 Watching system_prompt.txt for live changes (auto-reload active)');
+    } catch (e) {
+        console.warn('⚠️  Could not watch system_prompt.txt:', e.message);
+    }
 }
 
 // ─── Helper: get last N messages ─────────────────────────────────────────────
@@ -114,11 +193,20 @@ async function syncDatabase() {
             });
             console.log('✅ MongoDB Settings initialized.');
         } else {
+            // If local allowed numbers has '*' or 'all' (allow everyone), persist to MongoDB
+            if (cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all')) {
+                await Settings.findOneAndUpdate(
+                    { key: 'global_config' },
+                    { allowedNumbers: cachedAllowedNumbers, updatedAt: new Date() }
+                );
+                console.log('✅ Synchronized settings: ALLOW ALL numbers (*) active.');
+            } else if (config.allowedNumbers && config.allowedNumbers.length > 0 && !cachedAllowedNumbers.length) {
+                cachedAllowedNumbers = config.allowedNumbers;
+                fs.writeFileSync(ALLOWED_NUMBERS_FILE, cachedAllowedNumbers.join('\n'), 'utf8');
+                console.log('✅ Synced settings from MongoDB.');
+            }
             cachedSystemPrompt = config.systemPrompt || cachedSystemPrompt;
-            cachedAllowedNumbers = config.allowedNumbers || cachedAllowedNumbers;
             fs.writeFileSync(SYSTEM_PROMPT_FILE, cachedSystemPrompt, 'utf8');
-            fs.writeFileSync(ALLOWED_NUMBERS_FILE, cachedAllowedNumbers.join('\n'), 'utf8');
-            console.log('✅ Synced settings from MongoDB.');
         }
     } catch (err) {
         console.error('⚠️  MongoDB sync failed:', err.message);
@@ -314,6 +402,15 @@ async function main() {
 
     await connectDB(process.env.MONGODB_URI);
     await syncDatabase();
+    setupFileWatchers();
+
+    const allowAll = !cachedAllowedNumbers.length || cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all') || process.env.ALLOW_ALL_NUMBERS === 'true';
+    if (allowAll) {
+        console.log('🌟 Mode: ALL numbers allowed! (Every contact receives AI responses)\n');
+    } else {
+        console.log(`🔒 Mode: Whitelist active. Allowed: [${cachedAllowedNumbers.join(', ')}]\n`);
+    }
+
     await connectWhatsApp();
 }
 
