@@ -64,13 +64,36 @@ let localInterviews = [];
 try { localInterviews = JSON.parse(fs.readFileSync(INTERVIEWS_FILE, 'utf8')); } catch (e) {}
 
 // ─── AI Engine Configuration (Groq & Gemini) ─────────────────────────────────
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim().replace(/^["']|["']$/g, '');
+const GROQ_MODEL = (process.env.GROQ_MODEL || '').trim().replace(/^["']|["']$/g, '');
+let discoveredGroqModels = [];
+
+async function discoverGroqModels() {
+    if (!GROQ_API_KEY) return;
+    try {
+        const res = await fetch('https://api.groq.com/openai/v1/models', {
+            headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` }
+        });
+        if (res.ok) {
+            const data = await res.json();
+            const list = (data.data || []).map(m => m.id);
+            discoveredGroqModels = list.filter(m => !m.includes('whisper') && !m.includes('vision') && !m.includes('safetensors'));
+            if (discoveredGroqModels.length > 0) {
+                console.log(`⚡ [Groq Engine] Active models on your account: ${discoveredGroqModels.slice(0, 4).join(', ')}`);
+            }
+        } else {
+            const errText = await res.text();
+            console.warn(`⚠️  [Groq Auth] Verification returned status ${res.status}: ${errText.slice(0, 80)}...`);
+        }
+    } catch (e) {
+        console.warn('⚠️  [Groq] Could not query models:', e.message);
+    }
+}
 
 // Parse comma-separated Gemini keys for automatic round-robin rotation
 const geminiKeys = (process.env.GEMINI_API_KEY || '')
     .split(',')
-    .map(k => k.trim())
+    .map(k => k.trim().replace(/^["']|["']$/g, ''))
     .filter(Boolean);
 let currentGeminiKeyIndex = 0;
 
@@ -602,6 +625,7 @@ async function main() {
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
     await connectDB(process.env.MONGODB_URI);
+    await discoverGroqModels();
     setupFileWatchers();
 
     const allowAll = !cachedAllowedNumbers.length || cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all') || process.env.ALLOW_ALL_NUMBERS === 'true';
