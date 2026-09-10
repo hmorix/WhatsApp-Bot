@@ -4,6 +4,7 @@ dotenv.config();
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import qrcodeTerminal from 'qrcode-terminal';
 
 import makeWASocket, {
     useMultiFileAuthState,
@@ -138,7 +139,6 @@ async function connectWhatsApp() {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
-        printQRInTerminal: true,       // prints QR in terminal for first-time scan
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
         markOnlineOnConnect: true,
@@ -152,8 +152,11 @@ async function connectWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('\n📱 Scan this QR with WhatsApp → Linked Devices → Link a Device');
-            console.log('   (Only needed once! Session is saved permanently after scan)\n');
+            console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+            console.log('📱 Scan this QR in WhatsApp → Linked Devices → Link a Device');
+            console.log('   (Only needed once — session saved permanently after scan)\n');
+            qrcodeTerminal.generate(qr, { small: true });
+            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
         }
 
         if (connection === 'close') {
