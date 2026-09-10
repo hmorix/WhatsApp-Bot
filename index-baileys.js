@@ -383,7 +383,8 @@ async function callGroqAPI(messages, systemInstruction, activeAgent) {
                         ...messages   // proper multi-turn history + current user message
                     ],
                     temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
-                    max_tokens: 450
+                    max_tokens: 450,
+                    reasoning_effort: 'none'  // disable <think> chain-of-thought for qwen3/deepseek models
                 })
             });
 
@@ -503,6 +504,9 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
         else if (activeAgent === 'manik') systemInstruction = cachedPromptManik;
 
         let aiReply = await generateAIResponse(messages, systemInstruction, activeAgent);
+
+        // Strip <think>...</think> reasoning blocks (qwen3, deepseek-r1 thinking mode)
+        aiReply = aiReply.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
         // 1. Detect Agent Switch (Orix -> Blopsy)
         if (aiReply.includes('[AGENT_SWITCH:blopsy]')) {
