@@ -1,5 +1,7 @@
 import mongoose from 'mongoose';
 
+mongoose.set('bufferCommands', false);
+
 let isConnected = false;
 
 export async function connectDB(mongoUri) {

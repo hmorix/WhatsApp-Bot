@@ -182,7 +182,7 @@ async function setContactSession(phoneNumber, activeAgent, leadType = 'unknown')
 }
 
 // ─── Interview Management & Automated Reminders (2h, 1h, 15m) ────────────────
-async function recordScheduledInterview(phoneNumber, dateStr) {
+async function recordScheduledInterview(phoneNumber, dateStr, role = 'Client Consultation', candidateName = 'Client') {
     try {
         const scheduledTime = new Date(dateStr);
         if (isNaN(scheduledTime.getTime())) return;
@@ -190,6 +190,8 @@ async function recordScheduledInterview(phoneNumber, dateStr) {
         const record = {
             phoneNumber,
             scheduledTime,
+            role,
+            candidateName,
             status: 'scheduled',
             reminded2h: false,
             reminded1h: false,
@@ -201,9 +203,11 @@ async function recordScheduledInterview(phoneNumber, dateStr) {
         try { fs.writeFileSync(INTERVIEWS_FILE, JSON.stringify(localInterviews, null, 2), 'utf8'); } catch (e) {}
 
         if (isMongoConnected()) {
-            await Interview.create(record);
+            try {
+                await Interview.create(record);
+            } catch (e) {}
         }
-        console.log(`📅 [Interview Scheduled] Confirmed for ${phoneNumber} at: ${scheduledTime.toLocaleString('en-IN')}`);
+        console.log(`📅 [Meeting Scheduled] Confirmed for ${phoneNumber} (${role}) at: ${scheduledTime.toLocaleString('en-IN')}`);
     } catch (e) {
         console.error('Failed to schedule interview:', e.message);
     }
@@ -513,14 +517,19 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
             aiReply = aiReply.replace(/\[AGENT_SWITCH:blopsy\]/gi, '').trim();
             await setContactSession(phoneNumber, 'blopsy', 'candidate');
             console.log(`🔀 [Auto-Handshake] Handed off contact ${phoneNumber} from Orix to BLOPSY (HR)!`);
+        } else {
+            // Guarantee contact is tracked in sessions & dashboard
+            const leadType = activeAgent === 'blopsy' ? 'candidate' : activeAgent === 'manik' ? 'friend' : 'client';
+            await setContactSession(phoneNumber, activeAgent, leadType);
         }
 
-        // 2. Detect Scheduled Interview [INTERVIEW_SCHEDULED:YYYY-MM-DD HH:MM]
-        const scheduleMatch = aiReply.match(/\[INTERVIEW_SCHEDULED:([\d\-]+ [\d:]+)\]/i);
+        // 2. Detect Scheduled Meeting / Interview [INTERVIEW_SCHEDULED:...] or [MEETING_SCHEDULED:...]
+        const scheduleMatch = aiReply.match(/\[(?:INTERVIEW|MEETING)_SCHEDULED:([\d\-]+ [\d:]+)\]/i);
         if (scheduleMatch) {
             const dateTimeStr = scheduleMatch[1];
-            aiReply = aiReply.replace(/\[INTERVIEW_SCHEDULED:[\d\-]+ [\d:]+\]/gi, '').trim();
-            await recordScheduledInterview(phoneNumber, dateTimeStr);
+            aiReply = aiReply.replace(/\[(?:INTERVIEW|MEETING)_SCHEDULED:[\d\-]+ [\d:]+\]/gi, '').trim();
+            const meetingRole = activeAgent === 'blopsy' ? 'Candidate Interview' : 'Client Consultation';
+            await recordScheduledInterview(phoneNumber, dateTimeStr, meetingRole);
         }
 
         // Typing delay simulation
