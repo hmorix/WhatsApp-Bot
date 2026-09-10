@@ -12,6 +12,7 @@ import makeWASocket, {
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
     isJidBroadcast,
+    Browsers,
 } from '@whiskeysockets/baileys';
 
 import { Boom } from '@hapi/boom';
@@ -119,6 +120,23 @@ const logger = pino({ level: 'silent' });
 // ─── Message Queues per Sender (prevents dropped / overlapping messages) ─────
 const chatQueues = new Map(); // key: jid, value: { timeout, messages: [] }
 
+// ─── Anti-Ban & Anti-Flood Security Guard ────────────────────────────────────
+// Meta algorithms flag and ban accounts with high bursts (> 6 msgs/min per contact)
+const contactRateLimits = new Map(); // key: phone, value: timestamp[]
+const MAX_MESSAGES_PER_MINUTE = 6;
+
+function isRateLimited(phoneNumber) {
+    const now = Date.now();
+    let timestamps = contactRateLimits.get(phoneNumber) || [];
+    timestamps = timestamps.filter(t => now - t < 60_000);
+    if (timestamps.length >= MAX_MESSAGES_PER_MINUTE) {
+        return true;
+    }
+    timestamps.push(now);
+    contactRateLimits.set(phoneNumber, timestamps);
+    return false;
+}
+
 // ─── Helper: Allowed / Personal checks ───────────────────────────────────────
 function isAllowedUser(phoneNumber) {
     if (process.env.ALLOW_ALL_NUMBERS === 'true') return true;
@@ -214,7 +232,7 @@ async function recordScheduledInterview(phoneNumber, dateStr, role = 'Client Con
 }
 
 function startReminderWorker(sock) {
-    // Checks every 60 seconds for interviews needing reminders
+    // Checks every 60 seconds for meetings needing reminders
     setInterval(async () => {
         const now = Date.now();
 
@@ -232,41 +250,50 @@ function startReminderWorker(sock) {
             const timeDiffMs = interviewTime - now;
             const minutesLeft = Math.round(timeDiffMs / (60 * 1000));
             const jid = item.phoneNumber.includes('@') ? item.phoneNumber : `${item.phoneNumber}@s.whatsapp.net`;
+            const isClient = (item.role || '').toLowerCase().includes('consult') || (item.role || '').toLowerCase().includes('client');
+            const timeStr = new Date(item.scheduledTime).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
 
-            // 2 Hours Reminder (between 115 and 125 minutes)
-            if (minutesLeft > 60 && minutesLeft <= 125 && !item.reminded2h) {
-                const text = `👋 Hello! Gentle reminder from Blopsy at HMorix:\nYour scheduled interview is in approximately 2 hours (${new Date(item.scheduledTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}).\nPlease make sure you are in a quiet room with stable internet connection. All the best! ✨`;
-                try {
-                    await sock.sendMessage(jid, { text });
-                    item.reminded2h = true;
-                    if (item.save) await item.save();
-                    try { fs.writeFileSync(INTERVIEWS_FILE, JSON.stringify(localInterviews, null, 2), 'utf8'); } catch (e) {}
-                    console.log(`⏰ [Reminder Sent] 2-Hour reminder delivered to ${item.phoneNumber}`);
-                } catch (e) {}
-            }
+            // 1 Hour Reminder (between 45 and 70 minutes before)
+            if (minutesLeft > 20 && minutesLeft <= 70 && !item.reminded1h) {
+                const text = isClient
+                    ? `👋 Namaste! HMorix team se gentle reminder:\nAapka consultation call 1 ghante mein (${timeStr}) scheduled hai. We look forward to speaking with you! 🙏\n\n(Agar aap call reschedule karna chahte hain toh bas yahan batayein).`
+                    : `⏰ Gentle Reminder from Blopsy at HMorix:\nYour interview is coming up in approximately 1 hour (${timeStr})! Please ensure you have stable internet connection. All the best! ✨\n\n(Need to reschedule? Feel free to reply here).`;
 
-            // 1 Hour Reminder (between 50 and 65 minutes)
-            if (minutesLeft > 20 && minutesLeft <= 65 && !item.reminded1h) {
-                const text = `⏰ Reminder from HMorix (Blopsy):\nYour interview is coming up in 1 hour! Feel free to review our services at https://hmorix.in before we chat. See you soon!`;
                 try {
+                    // Simulate natural human presence before delivering reminder
+                    await sock.sendPresenceUpdate('composing', jid);
+                    await new Promise(r => setTimeout(r, 1500 + Math.random() * 800));
+                    await sock.sendPresenceUpdate('paused', jid);
+
                     await sock.sendMessage(jid, { text });
                     item.reminded1h = true;
                     if (item.save) await item.save();
                     try { fs.writeFileSync(INTERVIEWS_FILE, JSON.stringify(localInterviews, null, 2), 'utf8'); } catch (e) {}
-                    console.log(`⏰ [Reminder Sent] 1-Hour reminder delivered to ${item.phoneNumber}`);
-                } catch (e) {}
+                    console.log(`⏰ [Safe Reminder Sent] 1-Hour reminder delivered to ${item.phoneNumber}`);
+                } catch (e) {
+                    console.warn(`Failed to deliver 1h reminder to ${item.phoneNumber}:`, e.message);
+                }
             }
 
-            // 15 Minutes Reminder (between 5 and 18 minutes)
+            // 15 Minutes Final Ready Ping (between 3 and 18 minutes before)
             if (minutesLeft >= 0 && minutesLeft <= 18 && !item.reminded15m) {
-                const text = `🚀 Final reminder: Your interview with HMorix begins in 15 minutes! Please be ready. We are excited to meet you!`;
+                const text = isClient
+                    ? `🚀 Quick update: Our call begins in 15 minutes! Please be ready. See you soon! ✨`
+                    : `🚀 Final check: Your interview with HMorix starts in 15 minutes. We are excited to meet you! ✨`;
+
                 try {
+                    await sock.sendPresenceUpdate('composing', jid);
+                    await new Promise(r => setTimeout(r, 1200 + Math.random() * 600));
+                    await sock.sendPresenceUpdate('paused', jid);
+
                     await sock.sendMessage(jid, { text });
                     item.reminded15m = true;
                     if (item.save) await item.save();
                     try { fs.writeFileSync(INTERVIEWS_FILE, JSON.stringify(localInterviews, null, 2), 'utf8'); } catch (e) {}
-                    console.log(`⏰ [Reminder Sent] 15-Minute reminder delivered to ${item.phoneNumber}`);
-                } catch (e) {}
+                    console.log(`⏰ [Safe Reminder Sent] 15-Minute reminder delivered to ${item.phoneNumber}`);
+                } catch (e) {
+                    console.warn(`Failed to deliver 15m reminder to ${item.phoneNumber}:`, e.message);
+                }
             }
         }
     }, 60 * 1000);
@@ -471,12 +498,17 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
         return;
     }
 
+    // Anti-Ban: Flood protection — prevent responding more than 6 times/minute to the same contact
+    if (isRateLimited(phoneNumber)) {
+        console.warn(`🛡️  [Anti-Ban] High message burst detected from ${phoneNumber}. Throttling reply to protect WhatsApp account.`);
+        return;
+    }
+
     const activeAgent = await getActiveAgent(phoneNumber);
     const agentLabel = activeAgent === 'orix' ? '💼 ORIX (Smart Tech AI)' : activeAgent === 'blopsy' ? '👩‍💼 BLOPSY (HR)' : '👦 MANIK (Personal)';
     console.log(`\n📩 Message from ${phoneNumber} [Assigned: ${agentLabel}]:\n   "${combinedMessage}"`);
 
     try {
-        await sock.readMessages([originalMsg.key]);
         const history = await getLastMessages(phoneNumber, 12);
         await recordMessage(phoneNumber, 'USER', combinedMessage);
 
@@ -495,12 +527,16 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
         // Add current user message as the latest turn
         messages.push({ role: 'user', content: combinedMessage });
 
-        // Human-like reading delay
+        // Anti-Ban: Human-like reading delay BEFORE opening/reading the chat
         const wordCount = combinedMessage.split(/\s+/).length;
-        const readingDelayMs = Math.min(3000, Math.max(1500, wordCount * 250));
+        const readingDelayMs = Math.round(Math.min(3500, Math.max(1500, wordCount * 220)) * (0.9 + Math.random() * 0.25));
         console.log(`🤔 Reading for ${Math.round(readingDelayMs / 1000)}s...`);
         await new Promise(r => setTimeout(r, readingDelayMs));
 
+        // Mark as read (blue ticks) ONLY AFTER opening the chat naturally
+        await sock.readMessages([originalMsg.key]);
+
+        // Start typing indicator
         await sock.sendPresenceUpdate('composing', jid);
 
         let systemInstruction = cachedPromptOrix;
@@ -532,13 +568,17 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
             await recordScheduledInterview(phoneNumber, dateTimeStr, meetingRole);
         }
 
-        // Typing delay simulation
+        // Anti-Ban: Typing delay simulation with human jitter (85% to 115% variance)
         const responseWordCount = aiReply.split(/\s+/).length;
-        const typingDelayMs = Math.min(4500, Math.max(1800, responseWordCount * 300));
+        const humanJitter = 0.85 + Math.random() * 0.3;
+        const typingDelayMs = Math.round(Math.min(5000, Math.max(1600, responseWordCount * 220)) * humanJitter);
         console.log(`⏳ Typing for ${Math.round(typingDelayMs / 1000)}s...`);
         await new Promise(r => setTimeout(r, typingDelayMs));
 
+        // Natural pause (300-600ms) before pressing enter to send
         await sock.sendPresenceUpdate('paused', jid);
+        await new Promise(r => setTimeout(r, 300 + Math.random() * 300));
+
         await sock.sendMessage(jid, { text: aiReply }, { quoted: originalMsg });
         console.log(`🤖 Replied to ${phoneNumber} [${agentLabel}]:\n   "${aiReply}"`);
 
@@ -569,11 +609,11 @@ async function connectWhatsApp() {
         },
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
-        markOnlineOnConnect: true,
-        keepAliveIntervalMs: 25_000,       // ping WA every 25s to prevent 408 timeouts
-        connectTimeoutMs: 60_000,          // allow up to 60s for initial connect
-        retryRequestDelayMs: 2_000,        // wait 2s before retrying a failed request
-        browser: ['HMorix Bot', 'Chrome', '125.0.0'],
+        markOnlineOnConnect: false,         // Anti-Ban: Don't stay permanently online 24/7
+        keepAliveIntervalMs: 25_000,        // ping WA every 25s to prevent 408 timeouts
+        connectTimeoutMs: 60_000,           // allow up to 60s for initial connect
+        retryRequestDelayMs: 2_000,         // wait 2s before retrying a failed request
+        browser: Browsers.macOS('Desktop'), // Anti-Ban: Official desktop browser signature (NOT 'HMorix Bot')
     });
 
     sock.ev.on('creds.update', saveCreds);
