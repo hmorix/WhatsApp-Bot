@@ -63,8 +63,25 @@ try { localSessions = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catc
 let localInterviews = [];
 try { localInterviews = JSON.parse(fs.readFileSync(INTERVIEWS_FILE, 'utf8')); } catch (e) {}
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// ─── AI Engine Configuration (Groq & Gemini) ─────────────────────────────────
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+
+// Parse comma-separated Gemini keys for automatic round-robin rotation
+const geminiKeys = (process.env.GEMINI_API_KEY || '')
+    .split(',')
+    .map(k => k.trim())
+    .filter(Boolean);
+let currentGeminiKeyIndex = 0;
+
+// Gemini Model Priority Cascade (gemini-3.5-flash-lite has huge quota vs 2.5-flash's 20/day limit)
+const candidateGeminiModels = [
+    process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
+    'gemini-3.5-flash-lite',
+    'gemini-flash-latest',
+    'gemini-2.5-flash'
+].filter((v, i, a) => a.indexOf(v) === i); // unique
+
 const logger = pino({ level: 'silent' });
 
 // ─── Message Queues per Sender (prevents dropped / overlapping messages) ─────
@@ -297,35 +314,83 @@ function setupFileWatchers() {
     });
 }
 
-// ─── Robust Gemini Caller with Retries & Safe Fallback ────────────────────────
+// ─── Groq API Caller (Free Tier: 14,400 requests/day, fluent Hindi/Hinglish/English) ──
+async function callGroqAPI(prompt, systemInstruction, activeAgent) {
+    if (!GROQ_API_KEY) return null;
+    const url = 'https://api.groq.com/openai/v1/chat/completions';
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${GROQ_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            model: GROQ_MODEL,
+            messages: [
+                { role: 'system', content: systemInstruction },
+                { role: 'user', content: prompt }
+            ],
+            temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
+            max_tokens: 450
+        })
+    });
+
+    if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Groq HTTP ${res.status}: ${errText}`);
+    }
+
+    const json = await res.json();
+    return json.choices?.[0]?.message?.content?.trim() || '';
+}
+
+// ─── Robust Multi-Provider AI Caller with Retries & Auto-Fallback ─────────────
 async function generateAIResponse(fullPrompt, systemInstruction, activeAgent) {
-    const maxRetries = 2;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // 1. Priority: Groq Cloud API (Free tier: 14,400 requests/day)
+    if (GROQ_API_KEY) {
         try {
-            const response = await ai.models.generateContent({
-                model: GEMINI_MODEL,
-                contents: fullPrompt,
-                config: {
-                    systemInstruction,
-                    temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
-                    maxOutputTokens: 400,
-                },
-            });
-            const text = response.text ? response.text.trim() : '';
+            const text = await callGroqAPI(fullPrompt, systemInstruction, activeAgent);
             if (text) return text;
         } catch (err) {
-            console.error(`⚠️  Gemini API attempt ${attempt} failed:`, err.message || err);
-            if (attempt < maxRetries) await new Promise(r => setTimeout(r, 1200));
+            console.error('⚠️  Groq request failed, falling back to Gemini:', err.message);
         }
     }
 
-    // Graceful fallback response depending on active agent
+    // 2. Secondary: Google Gemini (With model cascade & key rotation)
+    if (geminiKeys.length > 0) {
+        for (const model of candidateGeminiModels) {
+            for (let i = 0; i < geminiKeys.length; i++) {
+                const apiKey = geminiKeys[(currentGeminiKeyIndex + i) % geminiKeys.length];
+                try {
+                    const client = new GoogleGenAI({ apiKey });
+                    const response = await client.models.generateContent({
+                        model,
+                        contents: fullPrompt,
+                        config: {
+                            systemInstruction,
+                            temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
+                            maxOutputTokens: 400,
+                        },
+                    });
+                    const text = response.text ? response.text.trim() : '';
+                    if (text) {
+                        currentGeminiKeyIndex = (currentGeminiKeyIndex + i) % geminiKeys.length;
+                        return text;
+                    }
+                } catch (err) {
+                    console.warn(`⚠️  [Gemini ${model}] Key ${i + 1} attempt failed: ${err.message?.slice(0, 100)}...`);
+                }
+            }
+        }
+    }
+
+    // 3. Graceful human fallback response so conversation never stops
     if (activeAgent === 'orix') {
-        return "Haan ji, main sun raha hun! Thoda sa connection glitch tha. HMorix ke products (BillingFlow, AI Agents, Web/App Development) ke baare mein aapko kya jaanna hai?";
+        return "Haan ji, main sun raha hun! HMorix ke products (BillingFlow, AI Agents, Web & App Development) ke baare mein aapko kya jaanna hai? Batayein!";
     } else if (activeAgent === 'blopsy') {
-        return "Hi! Main sun rahi hun, connection thoda slow tha. Aap kis role ke liye apply karna chahte hain? Please share karein!";
+        return "Hi! Main sun rahi hun. Aap kis role ke liye apply karna chahte hain? Please share karein!";
     } else {
-        return "Haan yrr sun raha hun, bata kya scene hai?";
+        return "Haan yrr bol, sun raha hun!";
     }
 }
 
