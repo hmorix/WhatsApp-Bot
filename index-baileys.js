@@ -74,13 +74,13 @@ const geminiKeys = (process.env.GEMINI_API_KEY || '')
     .filter(Boolean);
 let currentGeminiKeyIndex = 0;
 
-// Gemini Model Priority Cascade (gemini-3.5-flash-lite has huge quota vs 2.5-flash's 20/day limit)
+// Gemini Model Priority Cascade (gemini-3.5-flash-lite and gemini-flash-latest first)
 const candidateGeminiModels = [
-    process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
     'gemini-3.5-flash-lite',
     'gemini-flash-latest',
+    process.env.GEMINI_MODEL,
     'gemini-2.5-flash'
-].filter((v, i, a) => a.indexOf(v) === i); // unique
+].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i); // unique
 
 const logger = pino({ level: 'silent' });
 
@@ -315,33 +315,51 @@ function setupFileWatchers() {
 }
 
 // ─── Groq API Caller (Free Tier: 14,400 requests/day, fluent Hindi/Hinglish/English) ──
+const candidateGroqModels = [
+    process.env.GROQ_MODEL,
+    'llama-3.1-8b-instant',
+    'llama-3.3-70b-versatile',
+    'llama3-70b-8192',
+    'llama3-8b-8192',
+    'mixtral-8x7b-32768'
+].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i);
+
 async function callGroqAPI(prompt, systemInstruction, activeAgent) {
     if (!GROQ_API_KEY) return null;
     const url = 'https://api.groq.com/openai/v1/chat/completions';
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${GROQ_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            model: GROQ_MODEL,
-            messages: [
-                { role: 'system', content: systemInstruction },
-                { role: 'user', content: prompt }
-            ],
-            temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
-            max_tokens: 450
-        })
-    });
 
-    if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`Groq HTTP ${res.status}: ${errText}`);
+    for (const model of candidateGroqModels) {
+        try {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${GROQ_API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model,
+                    messages: [
+                        { role: 'system', content: systemInstruction },
+                        { role: 'user', content: prompt }
+                    ],
+                    temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
+                    max_tokens: 450
+                })
+            });
+
+            if (res.ok) {
+                const json = await res.json();
+                const text = json.choices?.[0]?.message?.content?.trim() || '';
+                if (text) return text;
+            } else {
+                const errText = await res.text();
+                console.warn(`⚠️  [Groq ${model}] failed (${res.status}): ${errText.slice(0, 100)}...`);
+            }
+        } catch (err) {
+            console.warn(`⚠️  [Groq ${model}] error:`, err.message);
+        }
     }
-
-    const json = await res.json();
-    return json.choices?.[0]?.message?.content?.trim() || '';
+    throw new Error('All Groq candidate models failed or returned empty.');
 }
 
 // ─── Robust Multi-Provider AI Caller with Retries & Auto-Fallback ─────────────
