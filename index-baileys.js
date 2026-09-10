@@ -338,18 +338,25 @@ function setupFileWatchers() {
 }
 
 // ─── Groq API Caller (Free Tier: 14,400 requests/day, fluent Hindi/Hinglish/English) ──
-const candidateGroqModels = [
+const defaultGroqModels = [
     process.env.GROQ_MODEL,
-    'llama-3.1-8b-instant',
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b',
+    'qwen/qwen3.8-27b',
+    'qwen/qwen3.6-27b',
+    'groq/compound',
+    'groq/compound-mini',
     'llama-3.3-70b-versatile',
-    'llama3-70b-8192',
-    'llama3-8b-8192',
-    'mixtral-8x7b-32768'
-].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i);
+    'llama-3.1-8b-instant'
+].filter(Boolean);
 
 async function callGroqAPI(prompt, systemInstruction, activeAgent) {
     if (!GROQ_API_KEY) return null;
     const url = 'https://api.groq.com/openai/v1/chat/completions';
+
+    // Prioritize dynamically discovered models, then defaults
+    const candidateGroqModels = [...discoveredGroqModels, ...defaultGroqModels]
+        .filter((v, i, a) => a.indexOf(v) === i);
 
     for (const model of candidateGroqModels) {
         try {
