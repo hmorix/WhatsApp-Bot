@@ -214,12 +214,7 @@ function isPersonalContact(phoneNumber) {
 
 // ─── Session Management (Agent Routing: Orix vs Blopsy vs Manik) ────────────
 async function getActiveAgent(phoneNumber) {
-    // 1. Personal contact list always routes to Manik
-    if (isPersonalContact(phoneNumber)) {
-        return 'manik';
-    }
-
-    // 2. Check MongoDB session
+    // 1. Check MongoDB session first (allows dynamic switches & manual testing overrides)
     if (isMongoConnected()) {
         try {
             const doc = await ContactSession.findOne({ phoneNumber });
@@ -227,9 +222,14 @@ async function getActiveAgent(phoneNumber) {
         } catch (e) {}
     }
 
-    // 3. Fallback to local session
+    // 2. Fallback to local session file
     if (localSessions[phoneNumber] && localSessions[phoneNumber].activeAgent) {
         return localSessions[phoneNumber].activeAgent;
+    }
+
+    // 3. Personal contact list defaults to Manik if no session set
+    if (isPersonalContact(phoneNumber)) {
+        return 'manik';
     }
 
     // 4. Default business agent: Orix
@@ -558,7 +558,105 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
         return;
     }
 
-    const activeAgent = await getActiveAgent(phoneNumber);
+    // ─── Manual Override Commands (/hmorix_model:orix, /hmorix_model:blopsy, /hmorix_model:manik, /reset) ───
+    const trimmedMsg = combinedMessage.trim();
+    const modelCmdMatch = trimmedMsg.match(/^\/(?:hmorix_model|agent|model|switch)(?:[:\s=]+(\w+))?$/i);
+    const isResetCmd = /^\/(?:reset|hmorix_reset)$/i.test(trimmedMsg);
+
+    if (modelCmdMatch || isResetCmd) {
+        let targetAgent = modelCmdMatch && modelCmdMatch[1] ? modelCmdMatch[1].toLowerCase() : null;
+        if (isResetCmd) targetAgent = 'reset';
+
+        if (!targetAgent || !['orix', 'blopsy', 'manik', 'reset'].includes(targetAgent)) {
+            const currentAgent = await getActiveAgent(phoneNumber);
+            const currentAgentLabel = currentAgent === 'orix'
+                ? '💼 ORIX (Business, Tech & Sales)'
+                : currentAgent === 'blopsy'
+                ? '👩‍💼 BLOPSY (HR & Recruitment)'
+                : '👦 MANIK (Personal)';
+
+            const helpText = `🤖 *HMorix Multi-Agent Switcher*\n\n` +
+                `Current active agent: *${currentAgentLabel}*\n\n` +
+                `Switch active agent instantly with:\n` +
+                `• \`/hmorix_model:orix\` ➔ 💼 *ORIX* (Solutions Consultant & Sales)\n` +
+                `• \`/hmorix_model:blopsy\` ➔ 👩‍💼 *BLOPSY* (Talent Acquisition & HR)\n` +
+                `• \`/hmorix_model:manik\` ➔ 👦 *MANIK* (Personal Hinglish Friend)\n` +
+                `• \`/reset\` ➔ 🔄 Reset to default agent`;
+
+            try {
+                await sock.readMessages([originalMsg.key]);
+                await sock.sendMessage(jid, { text: helpText }, { quoted: originalMsg });
+            } catch (e) {}
+            return;
+        }
+
+        if (targetAgent === 'reset') {
+            const defaultAgent = isPersonalContact(phoneNumber) ? 'manik' : 'orix';
+            const leadType = defaultAgent === 'manik' ? 'friend' : 'client';
+            await setContactSession(phoneNumber, defaultAgent, leadType);
+            console.log(`🔄 [Manual Reset] Contact ${phoneNumber} session reset to default: ${defaultAgent.toUpperCase()}`);
+            addLiveLog('cmd', `🔄 [${phoneNumber}] Session reset to ${defaultAgent.toUpperCase()}`);
+
+            const label = defaultAgent === 'orix'
+                ? '💼 *ORIX* (Senior AI Solutions Consultant & Business Lead)'
+                : '👦 *MANIK* (Personal Hinglish Friend)';
+
+            const resetReply = `🔄 *Session Reset Successfully!*\n\nDefault agent active: ${label}.\n\nHow can I help you today?`;
+            try {
+                await sock.readMessages([originalMsg.key]);
+                await sock.sendMessage(jid, { text: resetReply }, { quoted: originalMsg });
+                await recordMessage(phoneNumber, 'USER', combinedMessage);
+                await recordMessage(phoneNumber, 'AI', resetReply);
+            } catch (e) {}
+            return;
+        }
+
+        const leadType = targetAgent === 'blopsy' ? 'candidate' : targetAgent === 'manik' ? 'friend' : 'client';
+        await setContactSession(phoneNumber, targetAgent, leadType);
+        console.log(`🔀 [Manual Switch] Contact ${phoneNumber} switched to: ${targetAgent.toUpperCase()}`);
+        addLiveLog('cmd', `🔀 [${phoneNumber}] Switched agent ➔ ${targetAgent.toUpperCase()}`);
+
+        const agentDescriptions = {
+            orix: '💼 *ORIX* (Senior AI Solutions Consultant & Business Lead)\n_Handling: Web Development, Apps, SaaS Products, Pricing & Enterprise Solutions_',
+            blopsy: '👩‍💼 *BLOPSY* (Senior Talent Acquisition & HR Coordinator)\n_Handling: Candidate Screening, Job Vacancies, Tech Stack & Interviews_',
+            manik: '👦 *MANIK* (Personal Hinglish Friend)\n_Handling: Casual Hinglish conversations_'
+        };
+
+        const switchReply = `✅ *Agent Switched Successfully!*\n\nYou are now speaking with:\n${agentDescriptions[targetAgent]}\n\nHow can I assist you?`;
+        try {
+            await sock.readMessages([originalMsg.key]);
+            await sock.sendMessage(jid, { text: switchReply }, { quoted: originalMsg });
+            await recordMessage(phoneNumber, 'USER', combinedMessage);
+            await recordMessage(phoneNumber, 'AI', switchReply);
+        } catch (e) {}
+        return;
+    }
+
+    let activeAgent = await getActiveAgent(phoneNumber);
+
+    // Intent-based Auto-Routing BEFORE LLM generation:
+    // If contact is currently routed to Blopsy (HR), but sends client / product / website inquiry:
+    if (activeAgent === 'blopsy') {
+        const clientPattern = /(?:website|web development|app development|mobile app|software|billingflow|pricing|cost|price|prize|quotation|quote|build an? (?:app|website)|make an? (?:app|website)|restaurant|hire your company|your services|your products|(?:talk|connect|switch|change|shift)\s+(?:to|with)?\s*orix|orix se baat)/i;
+        const candidatePattern = /(?:resume|cv|applying|internship|job vacancy|job opening|fresher|interview|my tech stack|hiring for|hiring process|apply for|my role)/i;
+
+        if (clientPattern.test(combinedMessage) && !candidatePattern.test(combinedMessage)) {
+            console.log(`🔀 [Smart Router] Contact ${phoneNumber} sent client inquiry while on Blopsy. Auto-routing to ORIX!`);
+            addLiveLog('switch', `🔀 [${phoneNumber}] Auto-routed client inquiry to ORIX`);
+            activeAgent = 'orix';
+            await setContactSession(phoneNumber, 'orix', 'client');
+        }
+    } else if (activeAgent === 'orix') {
+        // If contact explicitly asks to talk to HR / Blopsy
+        const explicitBlopsy = /(?:(?:talk|connect|switch|change|shift)\s+(?:to|with)?\s*(?:blopsy|hr)|blopsy se baat|hr se baat)/i;
+        if (explicitBlopsy.test(combinedMessage)) {
+            console.log(`🔀 [Smart Router] Contact ${phoneNumber} explicitly requested HR. Auto-routing to BLOPSY!`);
+            addLiveLog('switch', `🔀 [${phoneNumber}] Explicit request to BLOPSY (HR)`);
+            activeAgent = 'blopsy';
+            await setContactSession(phoneNumber, 'blopsy', 'candidate');
+        }
+    }
+
     const agentLabel = activeAgent === 'orix' ? '💼 ORIX (Smart Tech AI)' : activeAgent === 'blopsy' ? '👩‍💼 BLOPSY (HR)' : '👦 MANIK (Personal)';
     console.log(`\n📩 Message from ${phoneNumber} [Assigned: ${agentLabel}]:\n   "${combinedMessage}"`);
     
@@ -605,11 +703,15 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
         // Strip <think>...</think> reasoning blocks (qwen3, deepseek-r1 thinking mode)
         aiReply = aiReply.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
-        // 1. Detect Agent Switch (Orix -> Blopsy)
-        if (aiReply.includes('[AGENT_SWITCH:blopsy]')) {
-            aiReply = aiReply.replace(/\[AGENT_SWITCH:blopsy\]/gi, '').trim();
-            await setContactSession(phoneNumber, 'blopsy', 'candidate');
-            console.log(`🔀 [Auto-Handshake] Handed off contact ${phoneNumber} from Orix to BLOPSY (HR)!`);
+        // 1. Detect Agent Switch in AI output: [AGENT_SWITCH:blopsy] or [AGENT_SWITCH:orix] or [AGENT_SWITCH:manik]
+        const switchMatch = aiReply.match(/\[AGENT_SWITCH\s*:\s*(orix|blopsy|manik)\]/i);
+        if (switchMatch) {
+            const nextAgent = switchMatch[1].toLowerCase();
+            aiReply = aiReply.replace(/\[AGENT_SWITCH\s*:\s*(?:orix|blopsy|manik)\]/gi, '').trim();
+            const nextLeadType = nextAgent === 'blopsy' ? 'candidate' : nextAgent === 'manik' ? 'friend' : 'client';
+            await setContactSession(phoneNumber, nextAgent, nextLeadType);
+            console.log(`🔀 [Auto-Handshake] Handed off contact ${phoneNumber} to ${nextAgent.toUpperCase()}!`);
+            addLiveLog('switch', `🔀 [${phoneNumber}] Handed off ➜ ${nextAgent.toUpperCase()}`);
         } else {
             // Guarantee contact is tracked in sessions & dashboard
             const leadType = activeAgent === 'blopsy' ? 'candidate' : activeAgent === 'manik' ? 'friend' : 'client';
@@ -617,10 +719,10 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
         }
 
         // 2. Detect Scheduled Meeting / Interview [INTERVIEW_SCHEDULED:...] or [MEETING_SCHEDULED:...]
-        const scheduleMatch = aiReply.match(/\[(?:INTERVIEW|MEETING)_SCHEDULED:([\d\-]+ [\d:]+)\]/i);
+        const scheduleMatch = aiReply.match(/\[(?:INTERVIEW|MEETING)_SCHEDULED\s*:\s*([\d\-]+ [\d:]+)\]/i);
         if (scheduleMatch) {
             const dateTimeStr = scheduleMatch[1];
-            aiReply = aiReply.replace(/\[(?:INTERVIEW|MEETING)_SCHEDULED:[\d\-]+ [\d:]+\]/gi, '').trim();
+            aiReply = aiReply.replace(/\[(?:INTERVIEW|MEETING)_SCHEDULED\s*:\s*[\d\-]+ [\d:]+\]/gi, '').trim();
             const meetingRole = activeAgent === 'blopsy' ? 'Candidate Interview' : 'Client Consultation';
             await recordScheduledInterview(phoneNumber, dateTimeStr, meetingRole);
         }
