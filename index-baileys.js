@@ -19,6 +19,7 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import { GoogleGenAI } from '@google/genai';
 import pino from 'pino';
+import QRCode from 'qrcode';
 
 import { connectDB, isMongoConnected } from './db.js';
 import { Settings } from './models/Settings.js';
@@ -32,6 +33,7 @@ const __dirname = path.dirname(__filename);
 // ─── Paths ───────────────────────────────────────────────────────────────────
 const CHATS_DIR = path.join(__dirname, 'chats');
 const AUTH_DIR = path.join(__dirname, 'baileys_auth');
+const STATUS_FILE = path.join(__dirname, 'whatsapp_status.json');
 const ALLOWED_NUMBERS_FILE = path.join(__dirname, 'allowed_numbers.txt');
 const PERSONAL_NUMBERS_FILE = path.join(__dirname, 'personal_numbers.txt');
 const SESSIONS_FILE = path.join(__dirname, 'contact_sessions.json');
@@ -40,6 +42,55 @@ const INTERVIEWS_FILE = path.join(__dirname, 'scheduled_interviews.json');
 const PROMPT_MANIK_FILE = path.join(__dirname, 'system_prompt.txt');
 const PROMPT_ORIX_FILE = path.join(__dirname, 'system_prompt_orix.txt');
 const PROMPT_BLOPSY_FILE = path.join(__dirname, 'system_prompt_blopsy.txt');
+
+// ─── Live WhatsApp State Manager (Shared with Dashboard Web UI) ───────────────
+let liveStatus = {
+    status: 'starting', // starting | waiting_qr | connecting | connected | reconnecting | logged_out | disconnected
+    qr: null,
+    qrGeneratedAt: null,
+    qrExpiresIn: 25,
+    connectedAt: null,
+    uptimeMs: 0,
+    reconnectCount: 0,
+    lastDisconnectCode: null,
+    lastDisconnectTime: null,
+    waWebVersion: 'Loading...',
+    activeAgents: ['ORIX (Sales)', 'BLOPSY (HR)', 'MANIK (Personal)'],
+    messagesSent: 0,
+    messagesReceived: 0,
+    logs: [],
+    updatedAt: Date.now()
+};
+
+function saveLiveStatus() {
+    try {
+        if (liveStatus.connectedAt && liveStatus.status === 'connected') {
+            liveStatus.uptimeMs = Date.now() - liveStatus.connectedAt;
+        }
+        liveStatus.updatedAt = Date.now();
+        fs.writeFileSync(STATUS_FILE, JSON.stringify(liveStatus, null, 2), 'utf8');
+    } catch (e) {}
+}
+
+function updateLiveStatus(patch = {}) {
+    Object.assign(liveStatus, patch);
+    saveLiveStatus();
+}
+
+function addLiveLog(type, text) {
+    const timestamp = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+    liveStatus.logs.push({ timestamp, type, text });
+    if (liveStatus.logs.length > 80) liveStatus.logs.shift();
+    saveLiveStatus();
+}
+
+// Periodic status sync every 4 seconds
+setInterval(() => {
+    if (liveStatus.status === 'connected') {
+        saveLiveStatus();
+    }
+}, 4000);
+
 
 // ─── Ensure directories & files exist ────────────────────────────────────────
 for (const dir of [CHATS_DIR, AUTH_DIR]) {
@@ -508,6 +559,9 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
     const activeAgent = await getActiveAgent(phoneNumber);
     const agentLabel = activeAgent === 'orix' ? '💼 ORIX (Smart Tech AI)' : activeAgent === 'blopsy' ? '👩‍💼 BLOPSY (HR)' : '👦 MANIK (Personal)';
     console.log(`\n📩 Message from ${phoneNumber} [Assigned: ${agentLabel}]:\n   "${combinedMessage}"`);
+    
+    liveStatus.messagesReceived++;
+    addLiveLog('in', `📩 [${phoneNumber}] "${combinedMessage.slice(0, 65)}"`);
 
     try {
         const history = await getLastMessages(phoneNumber, 12);
@@ -582,6 +636,9 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
 
         await sock.sendMessage(jid, { text: aiReply }, { quoted: originalMsg });
         console.log(`🤖 Replied to ${phoneNumber} [${agentLabel}]:\n   "${aiReply}"`);
+
+        liveStatus.messagesSent++;
+        addLiveLog('out', `🤖 [${agentLabel}] ➜ ${phoneNumber}: "${aiReply.slice(0, 65)}"`);
 
         await recordMessage(phoneNumber, 'AI', aiReply);
 
@@ -667,6 +724,8 @@ async function connectWhatsApp() {
         } catch (_) {}
     }
 
+    liveStatus.waWebVersion = version.join('.');
+    updateLiveStatus({ waWebVersion: version.join('.') });
     console.log(`📦 Using WA Web v${version.join('.')} ${isLatest ? '✅ (live updated)' : 'ℹ️ (safe default)'}`);
 
     const sock = makeWASocket({
@@ -693,9 +752,28 @@ async function connectWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
+            let qrDataUrl = null;
+            try {
+                qrDataUrl = await QRCode.toDataURL(qr, {
+                    width: 360,
+                    margin: 2,
+                    color: { dark: '#0f172a', light: '#ffffff' },
+                    errorCorrectionLevel: 'M'
+                });
+            } catch (e) {}
+
+            updateLiveStatus({
+                status: 'waiting_qr',
+                qr: qrDataUrl,
+                qrRaw: qr,
+                qrGeneratedAt: Date.now(),
+                qrExpiresIn: 25
+            });
+            addLiveLog('qr', '📱 New QR Code ready. View at http://localhost:3000');
+
             console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
             console.log('📱 Scan this QR in WhatsApp → Linked Devices → Link a Device');
-            console.log('   (Only needed once — session saved permanently after scan)\n');
+            console.log('   🌐 Web Dashboard: View clean single QR at http://localhost:3000');
             qrcodeTerminal.generate(qr, { small: true });
             console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
         }
@@ -704,8 +782,18 @@ async function connectWhatsApp() {
             const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
             console.log(`\n❌ Connection closed. Reason code: ${code}`);
 
+            addLiveLog('warn', `❌ Connection closed (Code: ${code}). Reconnecting...`);
+            updateLiveStatus({
+                status: code === DisconnectReason.loggedOut ? 'logged_out' : 'reconnecting',
+                reconnectCount: reconnectAttempts + 1,
+                lastDisconnectCode: code,
+                lastDisconnectTime: Date.now()
+            });
+
             if (code === DisconnectReason.loggedOut) {
                 console.log('🔒 Logged out! Clearing saved session...');
+                addLiveLog('error', '🔒 Logged out! Session cleared. Scan new QR.');
+                updateLiveStatus({ status: 'logged_out', qr: null });
                 fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 fs.mkdirSync(AUTH_DIR, { recursive: true });
                 process.exit(1);
@@ -746,6 +834,15 @@ async function connectWhatsApp() {
 
         if (connection === 'open') {
             reconnectAttempts = 0; // reset backoff on successful connect
+            updateLiveStatus({
+                status: 'connected',
+                qr: null,
+                qrRaw: null,
+                connectedAt: liveStatus.connectedAt || Date.now(),
+                reconnectCount: reconnectAttempts
+            });
+            addLiveLog('success', '✅ WhatsApp Connected! HMorix Multi-Agent Bot is LIVE.');
+
             console.log('\n✅ WhatsApp Connected! HMorix Multi-Agent Bot is LIVE.\n');
             console.log('   Agents active:');
             console.log('   • 💼 ORIX Smart Tech AI (Sales, Pricing, HMorix Services, Client Qualification)');
@@ -820,6 +917,9 @@ async function main() {
     console.log('\n🚀 HMorix Intelligent Multi-Agent WhatsApp System');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
+    addLiveLog('info', '🚀 HMorix WhatsApp Bot initializing...');
+    updateLiveStatus({ status: 'starting' });
+
     await connectDB(process.env.MONGODB_URI);
     await discoverGroqModels();
     setupFileWatchers();
@@ -844,12 +944,17 @@ async function main() {
 
 main().catch(err => {
     console.error('❌ Fatal error:', err);
+    addLiveLog('error', `❌ Fatal error: ${err.message || err}`);
+    updateLiveStatus({ status: 'disconnected' });
     process.exit(1);
 });
 
 process.on('SIGINT', () => {
     console.log('\n\n🛑 Bot stopped. Session saved — restart anytime without re-scanning QR.');
+    updateLiveStatus({ status: 'disconnected', qr: null });
+    addLiveLog('info', '🛑 Bot stopped by user (SIGINT).');
     process.exit(0);
 });
 process.on('unhandledRejection', reason => console.error('Unhandled Rejection:', reason));
 process.on('uncaughtException', error => console.error('Uncaught Exception:', error));
+

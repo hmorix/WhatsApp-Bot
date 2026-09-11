@@ -8,4 +8,6 @@ DOC-20260803-WA0003.zip
 *.log
 contact_sessions.json
 scheduled_interviews.json
+whatsapp_status.json
+
 
