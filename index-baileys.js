@@ -130,7 +130,7 @@ async function discoverGroqModels() {
         if (res.ok) {
             const data = await res.json();
             const list = (data.data || []).map(m => m.id);
-            // Only keep text chat/completion models — exclude classifiers, embedders, safety guards
+            // Only keep text chat/completion models — exclude classifiers, embedders, safety guards, TTS, terms-required
             discoveredGroqModels = list.filter(m =>
                 !m.includes('whisper') &&
                 !m.includes('vision') &&
@@ -138,10 +138,14 @@ async function discoverGroqModels() {
                 !m.includes('guard') &&
                 !m.includes('embed') &&
                 !m.includes('moderation') &&
-                !m.includes('classifier')
+                !m.includes('classifier') &&
+                !m.includes('orpheus') &&
+                !m.includes('allam') &&
+                !m.includes('tts') &&
+                !BLOCKED_GROQ_MODELS.has(m)
             );
             if (discoveredGroqModels.length > 0) {
-                console.log(`⚡ [Groq Engine] Active models on your account: ${discoveredGroqModels.slice(0, 4).join(', ')}`);
+                console.log(`⚡ [Groq Engine] Usable chat models: ${discoveredGroqModels.slice(0, 5).join(', ')}`);
             }
         } else {
             const errText = await res.text();
@@ -252,11 +256,80 @@ async function setContactSession(phoneNumber, activeAgent, leadType = 'unknown')
 }
 
 // ─── Interview Management & Automated Reminders (2h, 1h, 15m) ────────────────
-async function recordScheduledInterview(phoneNumber, dateStr, role = 'Client Consultation', candidateName = 'Client') {
+
+// Business hours: 10:00 AM – 7:00 PM (19:00)
+const MEETING_HOUR_START = 10;
+const MEETING_HOUR_END   = 19; // exclusive (7 PM = last allowed start = 18:59)
+const MEETING_SLOT_GAP_MINUTES = 20; // minimum minutes between meetings
+
+/**
+ * Check if proposed scheduledTime conflicts with existing meetings (±20 min window).
+ * Returns the conflicting meeting record or null.
+ */
+async function findSlotConflict(proposedTime, excludePhoneNumber = null) {
+    const gapMs = MEETING_SLOT_GAP_MINUTES * 60 * 1000;
+    let allMeetings = localInterviews;
+    if (isMongoConnected()) {
+        try { allMeetings = await Interview.find({ status: 'scheduled' }); } catch (e) {}
+    }
+    const pTime = new Date(proposedTime).getTime();
+    for (const m of allMeetings) {
+        if (excludePhoneNumber && m.phoneNumber === excludePhoneNumber) continue; // ignore same contact (reschedule)
+        const mTime = new Date(m.scheduledTime).getTime();
+        if (Math.abs(pTime - mTime) < gapMs) return m;
+    }
+    return null;
+}
+
+/**
+ * Main scheduling function.
+ * mode = 'schedule' | 'reschedule'
+ * Returns: { ok: true, scheduledTime } | { ok: false, reason: 'outside_hours'|'conflict', conflictTime? }
+ */
+async function recordScheduledInterview(phoneNumber, dateStr, role = 'Client Consultation', candidateName = 'Client', mode = 'schedule') {
     try {
         const scheduledTime = new Date(dateStr);
-        if (isNaN(scheduledTime.getTime())) return;
+        if (isNaN(scheduledTime.getTime())) {
+            console.warn(`📅 [Meeting] Invalid date string: "${dateStr}"`);
+            return { ok: false, reason: 'invalid_date' };
+        }
 
+        // ── Business Hours Guard ──────────────────────────────────────────────
+        const hour = scheduledTime.getHours();
+        if (hour < MEETING_HOUR_START || hour >= MEETING_HOUR_END) {
+            console.warn(`📅 [Meeting] Rejected — outside business hours: ${scheduledTime.toLocaleString('en-IN')}`);
+            return { ok: false, reason: 'outside_hours', scheduledTime };
+        }
+
+        // ── Slot Conflict Check ───────────────────────────────────────────────
+        // For reschedule, exclude the same phone's own existing slot from conflict check
+        const excludePhone = mode === 'reschedule' ? phoneNumber : null;
+        const conflict = await findSlotConflict(scheduledTime, excludePhone);
+        if (conflict) {
+            console.warn(`📅 [Meeting] Slot conflict detected at ${scheduledTime.toLocaleTimeString('en-IN')} — another meeting at ${new Date(conflict.scheduledTime).toLocaleString('en-IN')}`);
+            return { ok: false, reason: 'conflict', conflictTime: new Date(conflict.scheduledTime) };
+        }
+
+        // ── Reschedule: cancel any existing meeting for this phone ────────────
+        if (mode === 'reschedule') {
+            // Cancel existing local meeting records for this phone
+            const oldCount = localInterviews.length;
+            localInterviews = localInterviews.filter(m => m.phoneNumber !== phoneNumber || m.status !== 'scheduled');
+            if (localInterviews.length < oldCount) {
+                try { fs.writeFileSync(INTERVIEWS_FILE, JSON.stringify(localInterviews, null, 2), 'utf8'); } catch (e) {}
+                console.log(`📅 [Reschedule] Cancelled previous meeting for ${phoneNumber}`);
+            }
+            if (isMongoConnected()) {
+                try {
+                    await Interview.updateMany(
+                        { phoneNumber, status: 'scheduled' },
+                        { $set: { status: 'cancelled' } }
+                    );
+                } catch (e) {}
+            }
+        }
+
+        // ── Create new meeting record ─────────────────────────────────────────
         const record = {
             phoneNumber,
             scheduledTime,
@@ -273,13 +346,15 @@ async function recordScheduledInterview(phoneNumber, dateStr, role = 'Client Con
         try { fs.writeFileSync(INTERVIEWS_FILE, JSON.stringify(localInterviews, null, 2), 'utf8'); } catch (e) {}
 
         if (isMongoConnected()) {
-            try {
-                await Interview.create(record);
-            } catch (e) {}
+            try { await Interview.create(record); } catch (e) {}
         }
-        console.log(`📅 [Meeting Scheduled] Confirmed for ${phoneNumber} (${role}) at: ${scheduledTime.toLocaleString('en-IN')}`);
+
+        const modeLabel = mode === 'reschedule' ? 'Rescheduled' : 'Scheduled';
+        console.log(`📅 [Meeting ${modeLabel}] Confirmed for ${phoneNumber} (${role}) at: ${scheduledTime.toLocaleString('en-IN')}`);
+        return { ok: true, scheduledTime };
     } catch (e) {
         console.error('Failed to schedule interview:', e.message);
+        return { ok: false, reason: 'error' };
     }
 }
 
@@ -432,57 +507,91 @@ function setupFileWatchers() {
 }
 
 // ─── Groq API Caller (Free Tier: 14,400 requests/day, fluent Hindi/Hinglish/English) ──
+
+// Models known to support reasoning_effort (suppress <think> blocks)
+const REASONING_EFFORT_MODELS = new Set([
+    'qwen/qwen3.8-27b', 'qwen/qwen3.6-27b', 'qwen/qwen3-32b',
+    'qwen/qwen3-14b', 'qwen/qwen3-7b', 'qwen/qwen3-4b',
+    'deepseek-r1-distill-llama-70b', 'deepseek-r1-distill-qwen-32b'
+]);
+
+// Models known to cause errors (require terms, unsupported params, TTS-only)
+const BLOCKED_GROQ_MODELS = new Set([
+    'canopylabs/orpheus-v1-english', 'canopylabs/orpheus-arabic-saudi',
+    'allam-2-7b', 'groq/compound', 'groq/compound-mini',
+    'openai/gpt-oss-120b', 'openai/gpt-oss-20b'
+]);
+
+// Hardcoded reliable defaults — known to work well for chat with no issues
 const defaultGroqModels = [
     process.env.GROQ_MODEL,
-    'openai/gpt-oss-120b',
-    'openai/gpt-oss-20b',
+    'llama-3.3-70b-versatile',
+    'llama-3.1-70b-versatile',
+    'llama-3.1-8b-instant',
     'qwen/qwen3.8-27b',
     'qwen/qwen3.6-27b',
-    'groq/compound',
-    'groq/compound-mini',
-    'llama-3.3-70b-versatile',
-    'llama-3.1-8b-instant'
-].filter(Boolean);
+    'llama-3.2-11b-text-preview',
+    'gemma2-9b-it'
+].filter(m => m && !BLOCKED_GROQ_MODELS.has(m));
 
 // messages = array of {role: 'user'|'assistant', content: string}
 async function callGroqAPI(messages, systemInstruction, activeAgent) {
     if (!GROQ_API_KEY) return null;
     const url = 'https://api.groq.com/openai/v1/chat/completions';
 
-    // Prioritize dynamically discovered models, then defaults
+    // Combine discovered models + defaults; filter blocked ones
     const candidateGroqModels = [...discoveredGroqModels, ...defaultGroqModels]
+        .filter(m => m && !BLOCKED_GROQ_MODELS.has(m))
         .filter((v, i, a) => a.indexOf(v) === i);
 
     for (const model of candidateGroqModels) {
         try {
+            // Only send reasoning_effort for models that actually support it
+            const supportsReasoningEffort = REASONING_EFFORT_MODELS.has(model);
+
+            const body = {
+                model,
+                messages: [
+                    { role: 'system', content: systemInstruction },
+                    ...messages
+                ],
+                temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
+                max_tokens: 450,
+            };
+            if (supportsReasoningEffort) body.reasoning_effort = 'none';
+
             const res = await fetch(url, {
                 method: 'POST',
                 headers: {
                     'Authorization': `Bearer ${GROQ_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({
-                    model,
-                    messages: [
-                        { role: 'system', content: systemInstruction },
-                        ...messages   // proper multi-turn history + current user message
-                    ],
-                    temperature: activeAgent === 'orix' ? 0.7 : activeAgent === 'blopsy' ? 0.7 : 0.9,
-                    max_tokens: 450,
-                    reasoning_effort: 'none'  // disable <think> chain-of-thought for qwen3/deepseek models
-                })
+                body: JSON.stringify(body)
             });
 
             if (res.ok) {
                 const json = await res.json();
                 const text = json.choices?.[0]?.message?.content?.trim() || '';
-                if (text) return text;
+                if (text) {
+                    if (candidateGroqModels.indexOf(model) > 0) {
+                        console.log(`✅ [Groq] Response from: ${model}`);
+                    }
+                    return text;
+                }
             } else {
                 const errText = await res.text();
-                console.warn(`⚠️  [Groq ${model}] failed (${res.status}): ${errText.slice(0, 100)}...`);
+                const errObj = (() => { try { return JSON.parse(errText); } catch { return null; } })();
+                const errMsg = errObj?.error?.message || errText;
+                // If model requires terms acceptance, add to blocked list silently
+                if (errMsg.includes('terms acceptance') || errMsg.includes('requires terms')) {
+                    BLOCKED_GROQ_MODELS.add(model);
+                    console.warn(`🚫 [Groq] Blocked ${model} — requires terms acceptance.`);
+                } else {
+                    console.warn(`⚠️  [Groq ${model}] failed (${res.status}): ${errMsg.slice(0, 120)}`);
+                }
             }
         } catch (err) {
-            console.warn(`⚠️  [Groq ${model}] error:`, err.message);
+            console.warn(`⚠️  [Groq ${model}] network error:`, err.message);
         }
     }
     throw new Error('All Groq candidate models failed or returned empty.');
@@ -718,13 +827,39 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
             await setContactSession(phoneNumber, activeAgent, leadType);
         }
 
-        // 2. Detect Scheduled Meeting / Interview [INTERVIEW_SCHEDULED:...] or [MEETING_SCHEDULED:...]
-        const scheduleMatch = aiReply.match(/\[(?:INTERVIEW|MEETING)_SCHEDULED\s*:\s*([\d\-]+ [\d:]+)\]/i);
+        // 2. Detect Scheduled / Rescheduled Meeting or Interview
+        // AI uses [MEETING_SCHEDULED:YYYY-MM-DD HH:MM] or [MEETING_RESCHEDULED:YYYY-MM-DD HH:MM]
+        const scheduleMatch = aiReply.match(/\[((?:INTERVIEW|MEETING)_(?:SCHEDULED|RESCHEDULED))\s*:\s*([\d\-]+ [\d:]+)\]/i);
         if (scheduleMatch) {
-            const dateTimeStr = scheduleMatch[1];
-            aiReply = aiReply.replace(/\[(?:INTERVIEW|MEETING)_SCHEDULED\s*:\s*[\d\-]+ [\d:]+\]/gi, '').trim();
+            const fullTag = scheduleMatch[0];
+            const tagType = scheduleMatch[1].toUpperCase();
+            const dateTimeStr = scheduleMatch[2];
+            const isReschedule = tagType.includes('RESCHEDULE');
             const meetingRole = activeAgent === 'blopsy' ? 'Candidate Interview' : 'Client Consultation';
-            await recordScheduledInterview(phoneNumber, dateTimeStr, meetingRole);
+
+            // Remove marker from outbound message first
+            aiReply = aiReply.replace(new RegExp(fullTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '').trim();
+
+            const result = await recordScheduledInterview(phoneNumber, dateTimeStr, meetingRole, 'Client', isReschedule ? 'reschedule' : 'schedule');
+
+            if (!result.ok) {
+                if (result.reason === 'outside_hours') {
+                    const timeStr = result.scheduledTime
+                        ? result.scheduledTime.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })
+                        : dateTimeStr;
+                    // Append a polite correction to the AI's reply
+                    aiReply = aiReply + `\n\n⚠️ *Scheduling Note:* I'm unable to book at ${timeStr} as our team is available only between *10:00 AM – 7:00 PM*. Please choose a slot within that window.`;
+                    console.log(`📅 [Meeting] Rejected outside-hours slot for ${phoneNumber}`);
+                } else if (result.reason === 'conflict') {
+                    const conflictStr = result.conflictTime
+                        ? result.conflictTime.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })
+                        : 'that time';
+                    aiReply = aiReply + `\n\n⚠️ *Scheduling Note:* That slot is already taken (meeting at ${conflictStr}). Please suggest a time at least 20 minutes before or after.`;
+                    console.log(`📅 [Meeting] Slot conflict for ${phoneNumber}`);
+                }
+                // Record that the scheduling failed so AI context is accurate
+                await recordMessage(phoneNumber, 'AI', `[SYSTEM: Meeting not booked — ${result.reason}]`);
+            }
         }
 
         // Anti-Ban: Typing delay simulation with human jitter (85% to 115% variance)
