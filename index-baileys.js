@@ -283,9 +283,11 @@ async function recordScheduledInterview(phoneNumber, dateStr, role = 'Client Con
     }
 }
 
-function startReminderWorker(sock) {
+function startReminderWorker() {
     // Checks every 60 seconds for meetings needing reminders
     setInterval(async () => {
+        if (!currentSocket) return; // Only process reminders when socket is connected
+        const sock = currentSocket;
         const now = Date.now();
 
         let interviews = localInterviews;
@@ -698,35 +700,78 @@ function scheduleNightShutdown() {
     }, CHECK_INTERVAL_MS);
 }
 
-// ─── Main WhatsApp Connection ─────────────────────────────────────────────────
+// ─── Main WhatsApp Connection State ───────────────────────────────────────────
+let currentSocket = null;
+let isConnecting = false;
+let reconnectTimer = null;
 let reconnectAttempts = 0;
 let reminderWorkerStarted = false;
+let cachedWaVersion = null;
+
+function scheduleReconnect(delayMs, reason = '') {
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+    const safeDelay = Math.max(2000, delayMs);
+    console.log(`⏳ [Reconnect Queue] Reconnecting in ${Math.round(safeDelay / 1000)}s${reason ? ' (' + reason + ')' : ''}...`);
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectWhatsApp();
+    }, safeDelay);
+}
 
 async function connectWhatsApp() {
+    if (isConnecting) {
+        console.log('ℹ️  Connection attempt already in progress. Skipping duplicate call.');
+        return;
+    }
+    isConnecting = true;
+
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    // Clean up previous socket to prevent dual socket conflict (which causes 428/440 loop)
+    if (currentSocket) {
+        try {
+            currentSocket.ev.removeAllListeners('connection.update');
+            currentSocket.ev.removeAllListeners('creds.update');
+            currentSocket.ev.removeAllListeners('messages.upsert');
+            currentSocket.end(undefined);
+        } catch (e) {}
+        currentSocket = null;
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     
-    // Resilient version detection: Try live WA Web first, fallback to Baileys release, fallback to safe pinned
-    let version = [2, 3000, 1047236770];
+    // Resilient version detection: Cached so we never hammer web.whatsapp.com on every reconnect
+    let version = cachedWaVersion || [2, 3000, 1047236770];
     let isLatest = false;
-    try {
-        const wa = await fetchLatestWaWebVersion();
-        if (wa?.version && Array.isArray(wa.version)) {
-            version = wa.version;
-            isLatest = wa.isLatest;
-        }
-    } catch (e) {
+    if (!cachedWaVersion) {
         try {
-            const b = await fetchLatestBaileysVersion();
-            if (b?.version && Array.isArray(b.version)) {
-                version = b.version;
-                isLatest = b.isLatest;
+            const wa = await fetchLatestWaWebVersion();
+            if (wa?.version && Array.isArray(wa.version)) {
+                version = wa.version;
+                cachedWaVersion = version;
+                isLatest = wa.isLatest;
             }
-        } catch (_) {}
+        } catch (e) {
+            try {
+                const b = await fetchLatestBaileysVersion();
+                if (b?.version && Array.isArray(b.version)) {
+                    version = b.version;
+                    cachedWaVersion = version;
+                    isLatest = b.isLatest;
+                }
+            } catch (_) {}
+        }
     }
 
     liveStatus.waWebVersion = version.join('.');
     updateLiveStatus({ waWebVersion: version.join('.') });
-    console.log(`📦 Using WA Web v${version.join('.')} ${isLatest ? '✅ (live updated)' : 'ℹ️ (safe default)'}`);
+    console.log(`📦 Using WA Web v${version.join('.')} ${isLatest ? '✅ (live updated)' : 'ℹ️ (cached)'}`);
 
     const sock = makeWASocket({
         version,
@@ -737,14 +782,16 @@ async function connectWhatsApp() {
         },
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
-        markOnlineOnConnect: false,         // Anti-Ban: Don't stay permanently online 24/7
-        keepAliveIntervalMs: 60_000,        // 60s interval gives a wide 65s buffer (stops artificial 408 disconnects)
-        defaultQueryTimeoutMs: 90_000,      // Allow 90s for queries to complete on mobile networks
+        markOnlineOnConnect: true,          // Required: Signals to WhatsApp server that client is active (prevents passive 428 disconnects)
+        keepAliveIntervalMs: 25_000,        // 25s keep-alive ping satisfies WhatsApp server's 30-45s inactivity timeout!
+        defaultQueryTimeoutMs: 60_000,      // Allow 60s for queries to complete on mobile networks
         connectTimeoutMs: 60_000,           // Allow up to 60s for initial connect
         retryRequestDelayMs: 2_500,         // Wait 2.5s before retrying
         maxMsgRetryCount: 5,
-        browser: Browsers.macOS('Desktop'), // Anti-Ban: Official desktop browser signature (NOT 'HMorix Bot')
+        browser: Browsers.ubuntu('Chrome'), // Standard Ubuntu Chrome profile matching Linux/Termux environment
     });
+
+    currentSocket = sock;
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -779,6 +826,7 @@ async function connectWhatsApp() {
         }
 
         if (connection === 'close') {
+            isConnecting = false;
             const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
             console.log(`\n❌ Connection closed. Reason code: ${code}`);
 
@@ -798,41 +846,40 @@ async function connectWhatsApp() {
                 fs.mkdirSync(AUTH_DIR, { recursive: true });
                 process.exit(1);
             } else if (code === 428) {
-                // 428 = connectionClosed — WhatsApp WebSocket was cleanly closed by the server.
-                // This is NORMAL on Termux/mobile when screen turns off or network briefly changes.
-                // DO NOT clear auth — just reconnect. Clearing auth here was causing overnight session wipes.
-                console.log('🔄 [Code 428] Connection closed by server (normal on mobile). Reconnecting in 8s...');
-                setTimeout(() => connectWhatsApp(), 8_000);
+                // 428 = connectionClosed — Add progressive backoff with jitter to prevent reconnect storms
+                reconnectAttempts++;
+                const delayMs = Math.min(10_000 + (reconnectAttempts * 3_000) + Math.random() * 2000, 45_000);
+                console.log(`🔄 [Code 428] Server closed socket. Safe reconnect in ${Math.round(delayMs / 1000)}s (attempt ${reconnectAttempts})...`);
+                scheduleReconnect(delayMs, 'Code 428 Safe Recovery');
             } else if (code === 503) {
                 // 503 = WhatsApp servers temporarily overloaded. Wait longer to avoid hammering.
                 console.log('⏳ [Code 503] WhatsApp servers busy. Waiting 45s before reconnect...');
-                setTimeout(() => connectWhatsApp(), 45_000);
+                scheduleReconnect(45_000, 'Code 503 Server Busy');
             } else if (code === DisconnectReason.connectionReplaced || code === 440) {
                 // 440 = Connection Replaced — another WhatsApp Web session opened
                 console.log('⚠️  [Code 440] Session replaced! Another WhatsApp Web session is active.');
-                console.log('   ➜ Close WhatsApp Web in ALL browser tabs on this account.');
-                console.log('   ➜ Make sure only ONE instance of this bot is running.');
                 console.log('   ➜ Retrying in 15s — bot will reclaim the session automatically...');
                 reconnectAttempts = 0;
-                setTimeout(() => connectWhatsApp(), 15_000);
+                scheduleReconnect(15_000, 'Code 440 Session Reclaim');
             } else if (code === DisconnectReason.restartRequired || code === 515) {
                 // 515 = Normal restart required by WhatsApp
                 console.log('🔄 WhatsApp requested session restart (code 515). Reconnecting in 3s...');
-                setTimeout(() => connectWhatsApp(), 3000);
+                scheduleReconnect(3_000, 'Code 515 Handshake Complete');
             } else if (code === DisconnectReason.connectionLost || code === DisconnectReason.timedOut || code === 408) {
                 // 408 = Mobile network switch / TCP ping timeout — restore instantly
-                console.log('📡 Mobile network route changed/timeout (code 408). Auto-restoring in 3s...');
-                setTimeout(() => connectWhatsApp(), 3000);
+                console.log('📡 Mobile network route changed/timeout (code 408). Auto-restoring in 4s...');
+                scheduleReconnect(4_000, 'Code 408 Route Reset');
             } else {
                 // Exponential backoff: 5s, 10s, 20s, 40s, then cap at 60s
                 reconnectAttempts++;
                 const delayMs = Math.min(5000 * Math.pow(2, reconnectAttempts - 1), 60_000);
                 console.log(`🔄 Reconnecting in ${Math.round(delayMs / 1000)}s... (attempt ${reconnectAttempts})`);
-                setTimeout(() => connectWhatsApp(), delayMs);
+                scheduleReconnect(delayMs, 'General Backoff');
             }
         }
 
         if (connection === 'open') {
+            isConnecting = false;
             reconnectAttempts = 0; // reset backoff on successful connect
             updateLiveStatus({
                 status: 'connected',
@@ -905,7 +952,7 @@ async function connectWhatsApp() {
 
     // Start background interview reminder worker (only once, not on every reconnect)
     if (!reminderWorkerStarted) {
-        startReminderWorker(sock);
+        startReminderWorker();
         reminderWorkerStarted = true;
     }
 
