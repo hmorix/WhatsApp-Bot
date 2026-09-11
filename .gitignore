@@ -2,6 +2,10 @@ node_modules/
 .env
 .wwebjs_auth/
 .wwebjs_cache/
+baileys_auth/
 chats/
 DOC-20260803-WA0003.zip
 *.log
+contact_sessions.json
+scheduled_interviews.json
+

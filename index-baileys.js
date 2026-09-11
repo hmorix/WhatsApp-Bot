@@ -9,6 +9,7 @@ import qrcodeTerminal from 'qrcode-terminal';
 import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
+    fetchLatestWaWebVersion,
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
     isJidBroadcast,
@@ -590,15 +591,83 @@ async function processUserMessages(sock, jid, phoneNumber, combinedMessage, orig
     }
 }
 
+// ─── Night Auto-Shutdown (Anti-Ban: Rest period 11 PM onwards) ───────────────
+// Real WhatsApp users don't chat 24/7. A rest period drastically reduces
+// bot-detection risk. Bot auto-shuts down at 23:00 if it was running before then.
+// If started AFTER 11 PM — just warn the user, don't force-stop.
+function scheduleNightShutdown() {
+    const CHECK_INTERVAL_MS = 60_000; // check every minute
+
+    const now = new Date();
+    const hour = now.getHours();
+
+    // If already past 11 PM at startup — just warn, don't block
+    if (hour >= 23) {
+        console.log('\n⚠️  [Night Mode] Started after 11:00 PM.');
+        console.log('   Bot is running. Please stop it before you sleep (Ctrl+C).');
+        console.log('   No auto-shutdown since bot was manually started late.\n');
+        return; // don't arm the timer — user started it manually after hours
+    }
+
+    // Calculate shutdown time and display countdown
+    const shutdownToday = new Date();
+    shutdownToday.setHours(23, 0, 0, 0);
+    const msUntilShutdown = shutdownToday - now;
+    const hrs = Math.floor(msUntilShutdown / 3_600_000);
+    const mins = Math.floor((msUntilShutdown % 3_600_000) / 60_000);
+    console.log(`🌙 [Night Mode] Auto-shutdown scheduled at 11:00 PM (in ${hrs}h ${mins}m)`);
+
+    const checker = setInterval(() => {
+        const current = new Date();
+        const currentHour = current.getHours();
+        const currentMin = current.getMinutes();
+
+        // 5-minute warning at 10:55 PM
+        if (currentHour === 22 && currentMin === 55) {
+            console.log('\n🌙 [Night Mode] ⚠️  Bot stops in 5 minutes (11:00 PM).');
+            console.log('   ➜ Session will be saved — restart with: bash start.sh');
+        }
+
+        // Hard shutdown at 11:00 PM
+        if (currentHour >= 23) {
+            console.log('\n🌙 ══════════════════════════════════════════════════');
+            console.log('   Auto-Shutdown: 11:00 PM Night Rest Mode activated.');
+            console.log('   ✅ Session saved — no re-scan needed tomorrow.');
+            console.log('   ➜  Restart tomorrow with: bash start.sh');
+            console.log('   ══════════════════════════════════════════════════\n');
+            clearInterval(checker);
+            process.exit(0);
+        }
+    }, CHECK_INTERVAL_MS);
+}
+
 // ─── Main WhatsApp Connection ─────────────────────────────────────────────────
 let reconnectAttempts = 0;
 let reminderWorkerStarted = false;
 
 async function connectWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const { version } = await fetchLatestBaileysVersion();
+    
+    // Resilient version detection: Try live WA Web first, fallback to Baileys release, fallback to safe pinned
+    let version = [2, 3000, 1047236770];
+    let isLatest = false;
+    try {
+        const wa = await fetchLatestWaWebVersion();
+        if (wa?.version && Array.isArray(wa.version)) {
+            version = wa.version;
+            isLatest = wa.isLatest;
+        }
+    } catch (e) {
+        try {
+            const b = await fetchLatestBaileysVersion();
+            if (b?.version && Array.isArray(b.version)) {
+                version = b.version;
+                isLatest = b.isLatest;
+            }
+        } catch (_) {}
+    }
 
-    console.log(`📦 Using WA Web v${version.join('.')}`);
+    console.log(`📦 Using WA Web v${version.join('.')} ${isLatest ? '✅ (live updated)' : 'ℹ️ (safe default)'}`);
 
     const sock = makeWASocket({
         version,
@@ -641,12 +710,15 @@ async function connectWhatsApp() {
                 fs.mkdirSync(AUTH_DIR, { recursive: true });
                 process.exit(1);
             } else if (code === 428) {
-                // 428 = Precondition Required — WA is rejecting the session key state.
-                console.log('⚠️  Session rejected by WhatsApp (code 428). Clearing stale auth & exiting.');
-                console.log('   ➜ Restart the bot and re-scan the QR code.');
-                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-                fs.mkdirSync(AUTH_DIR, { recursive: true });
-                process.exit(1);
+                // 428 = connectionClosed — WhatsApp WebSocket was cleanly closed by the server.
+                // This is NORMAL on Termux/mobile when screen turns off or network briefly changes.
+                // DO NOT clear auth — just reconnect. Clearing auth here was causing overnight session wipes.
+                console.log('🔄 [Code 428] Connection closed by server (normal on mobile). Reconnecting in 8s...');
+                setTimeout(() => connectWhatsApp(), 8_000);
+            } else if (code === 503) {
+                // 503 = WhatsApp servers temporarily overloaded. Wait longer to avoid hammering.
+                console.log('⏳ [Code 503] WhatsApp servers busy. Waiting 45s before reconnect...');
+                setTimeout(() => connectWhatsApp(), 45_000);
             } else if (code === DisconnectReason.connectionReplaced || code === 440) {
                 // 440 = Connection Replaced — another WhatsApp Web session opened
                 console.log('⚠️  [Code 440] Session replaced! Another WhatsApp Web session is active.');
@@ -751,6 +823,7 @@ async function main() {
     await connectDB(process.env.MONGODB_URI);
     await discoverGroqModels();
     setupFileWatchers();
+    scheduleNightShutdown(); // Auto-stop at 11 PM to protect against WhatsApp suspension
 
     const allowAll = !cachedAllowedNumbers.length || cachedAllowedNumbers.includes('*') || cachedAllowedNumbers.includes('all') || process.env.ALLOW_ALL_NUMBERS === 'true';
     if (allowAll) {
